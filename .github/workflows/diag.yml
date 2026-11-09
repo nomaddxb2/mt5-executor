@@ -59,11 +59,15 @@ jobs:
           if (!(Test-Path 'C:\mt5\terminal64.exe')) { throw 'C:\mt5\terminal64.exe is missing' }
           python -c "import MetaTrader5 as mt5; print('MetaTrader5', mt5.__version__)"
 
-      - name: Diagnose
+      - name: Diagnose login and execution
         shell: pwsh
         env:
           PYTHONUNBUFFERED: '1'
-        run: python -u mt5_diag.py 2>&1 | Tee-Object -FilePath diag.log
+          MT5_TEST_LOGIN: ${{ secrets.MT5_TEST_LOGIN }}
+          MT5_TEST_PASSWORD: ${{ secrets.MT5_TEST_PASSWORD }}
+          MT5_TEST_SERVER: ${{ secrets.MT5_TEST_SERVER }}
+          MT5_DIAG_TRADE: '1'
+        run: python -u mt5_diag_login.py 2>&1 | Tee-Object -FilePath diag.log
 
       - name: Pipe and process snapshot
         if: always()
