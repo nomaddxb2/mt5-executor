@@ -297,6 +297,39 @@ def mcp_test():
         out("mcp order result", json.dumps(body)[:1500])
 
 
+
+out("=== mt5 python attach")
+try:
+    import MetaTrader5 as mt5
+    ok = mt5.initialize(path=TERMINAL, portable=True, timeout=60000)
+    out("initialize", ok, mt5.last_error())
+    if ok:
+        ai = mt5.account_info()
+        out("account", ai._asdict() if ai else None)
+        tick = mt5.symbol_info_tick("EURUSD")
+        out("tick", tick._asdict() if tick else None)
+        if tick:
+            req = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": "EURUSD",
+                "volume": 0.01,
+                "type": mt5.ORDER_TYPE_BUY,
+                "price": tick.ask,
+                "deviation": 50,
+                "magic": 20261109,
+                "comment": "eni py",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            res = mt5.order_send(req)
+            out("order_send", res._asdict() if res else None)
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                pos = mt5.positions_get()
+                out("positions", [p._asdict() for p in (pos or [])])
+        mt5.shutdown()
+except Exception as exc:
+    out("mt5 attach error", exc)
+
 mcp_test()
 
 for name in ("terminal.ini", "start.ini", "common.ini"):
