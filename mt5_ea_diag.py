@@ -196,6 +196,24 @@ if TRADE and state.get("login") and state.get("trade_allowed"):
 else:
     out("skipping trade", "login", state.get("login"), "trade_allowed", state.get("trade_allowed"))
 
+def ini_sections(path, wanted):
+    text = read_text(path, 30000)
+    block = []
+    keep = False
+    for line in text.splitlines():
+        st = line.strip()
+        if st.startswith("["):
+            keep = any(w.lower() in st.lower() for w in wanted)
+        if keep:
+            block.append(line)
+    return "\n".join(block)
+
+for name in ("terminal.ini", "start.ini", "common.ini"):
+    out("=== ini", name)
+    out(ini_sections(os.path.join(DATA, "config", name), ["Experts", "StartUp", "Common"]))
+out("=== assistant.ini")
+out(read_text(os.path.join(DATA, "config", "assistant.ini"), 4000))
+
 out("=== mql logs")
 mlogs = os.path.join(DATA, "MQL5", "Logs")
 try:
