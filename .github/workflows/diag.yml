@@ -1,0 +1,81 @@
+name: mt5-diag
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache MetaTrader 5 terminal
+        id: mt5-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\mt5
+          key: mt5-terminal-6231
+
+      - name: Install MetaTrader 5
+        if: steps.mt5-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP 'mt5setup.exe'
+          Invoke-WebRequest -Uri 'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe' -OutFile $setup
+          Start-Process -FilePath $setup -ArgumentList '/auto' -Wait
+          $candidates = @(
+            'C:\Program Files\MetaTrader 5',
+            'C:\Program Files\MetaTrader 5 Terminal',
+            (Join-Path $env:LOCALAPPDATA 'Programs\MetaTrader 5')
+          )
+          $src = $null
+          for ($i = 0; $i -lt 30 -and -not $src; $i++) {
+            $src = $candidates | Where-Object { Test-Path (Join-Path $_ 'terminal64.exe') } | Select-Object -First 1
+            if (-not $src) { Start-Sleep -Seconds 2 }
+          }
+          if (-not $src) {
+            Get-ChildItem 'C:\Program Files' -Directory | Select-Object -ExpandProperty FullName
+            throw 'MetaTrader 5 installation did not produce terminal64.exe'
+          }
+          New-Item -ItemType Directory -Force -Path 'C:\mt5' | Out-Null
+          Copy-Item (Join-Path $src '*') 'C:\mt5' -Recurse -Force
+          Get-Item 'C:\mt5\terminal64.exe' | Select-Object FullName, Length
+
+      - name: Verify terminal
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'C:\mt5\terminal64.exe')) { throw 'C:\mt5\terminal64.exe is missing' }
+          python -c "import MetaTrader5 as mt5; print('MetaTrader5', mt5.__version__)"
+
+      - name: Diagnose
+        shell: pwsh
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: python -u mt5_diag.py 2>&1 | Tee-Object -FilePath diag.log
+
+      - name: Pipe and process snapshot
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Select-Object Id,Path,StartTime | Format-List
+          Get-ChildItem \\.\pipe\ | Where-Object { $_.Name -like '*MT5*' } | Select-Object -ExpandProperty Name
+          Get-ChildItem 'C:\mt5\logs' -ErrorAction SilentlyContinue | Select-Object Name,Length
+
+      - name: Upload diag log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt5-diag
+          path: diag.log
