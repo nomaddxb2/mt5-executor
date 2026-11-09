@@ -373,14 +373,16 @@ class TerminalPool:
             wanted = WATCHLIST
         out = []
         for name in wanted:
-            tick = self._tick(name)
+            broker = self._resolve(name)
+            tick = self._tick(broker)
             if tick is None:
                 continue
-            info = mt5.symbol_info(name)
+            info = mt5.symbol_info(broker)
             digits = info.digits if info else 5
             out.append(
                 {
                     "symbol": name,
+                    "brokerSymbol": broker,
                     "bid": round(float(tick.bid), digits),
                     "ask": round(float(tick.ask), digits),
                     "spread": round(float(tick.ask) - float(tick.bid), digits),
@@ -399,6 +401,7 @@ class TerminalPool:
         volume = float(payload.get("volume") or 0)
         if not symbol or side not in ("buy", "sell") or volume <= 0:
             raise Mt5Error("symbol, side and volume are required", "invalid_order")
+        symbol = self._resolve(symbol)
         tick = self._tick(symbol)
         if tick is None or not tick.ask:
             raise Mt5Error("No tick for %s" % symbol, "symbol_unavailable")
@@ -489,7 +492,7 @@ class TerminalPool:
         self._ensure(credentials)
         if self.dry_run:
             return {"order": {"ticket": 1, "status": "dry-run"}, "mode": "dry-run"}
-        symbol = str(payload.get("symbol") or "").upper()
+        symbol = self._resolve(str(payload.get("symbol") or ""))
         side = str(payload.get("side") or "").lower()
         kind = str(payload.get("type") or "limit").lower()
         volume = float(payload.get("volume") or 0)
@@ -580,6 +583,26 @@ class TerminalPool:
         }
 
     # ---------------------------------------------------------------- helpers
+    def _resolve(self, symbol: str) -> str:
+        name = str(symbol or "").strip().upper()
+        if not name or mt5 is None:
+            return name
+        info = mt5.symbol_info(name)
+        if info is not None:
+            return info.name
+        for suffix in ("m", ".m", ".raw", "m.raw", "z", ".z"):
+            cand = name + suffix
+            info = mt5.symbol_info(cand)
+            if info is not None:
+                return info.name
+        try:
+            for row in mt5.symbols_get() or []:
+                if str(row.name).upper() == name:
+                    return row.name
+        except Exception:
+            pass
+        return name
+
     def _tick(self, symbol: str):
         mt5.symbol_select(symbol, True)
         tick = None
