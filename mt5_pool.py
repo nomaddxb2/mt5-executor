@@ -92,21 +92,26 @@ class TerminalPool:
         timeout_ms = int(os.environ.get("MT5_CONNECT_TIMEOUT_MS", "120000"))
         last_code, last_message = -1, "unknown"
         ok = False
-        # Attach to the terminal that the warm workflow already started and logged in.
+        # Attach to the terminal that the warm workflow already started.
         try:
             ok = mt5.initialize(path=TERMINAL_PATH, timeout=timeout_ms, portable=True)
         except Exception:
             ok = False
         if ok:
             ai = mt5.account_info()
+            ti = mt5.terminal_info()
             same_login = ai is not None and str(ai.login) == str(credentials.get("login"))
             same_server = ai is not None and str(ai.server or "").lower() == str(credentials.get("server") or "").lower()
-            if not (same_login and same_server):
+            trading = ti is not None and bool(getattr(ti, "trade_allowed", False))
+            if not (same_login and same_server and trading):
                 ok = False
                 try:
                     mt5.shutdown()
                 except Exception:
                     pass
+        # Restart the terminal with an explicit startup config that enables AutoTrading.
+        if not ok:
+            ok = self._restart_with_experts(credentials)
         for attempt in range(3):
             if ok:
                 break
@@ -119,6 +124,9 @@ class TerminalPool:
                 portable=True,
             )
             if ok:
+                ti = mt5.terminal_info()
+                if ti is not None and not bool(getattr(ti, "trade_allowed", False)):
+                    ok = self._restart_with_experts(credentials)
                 break
             error = mt5.last_error()
             if error:
@@ -583,6 +591,82 @@ class TerminalPool:
         }
 
     # ---------------------------------------------------------------- helpers
+    def _write_start_ini(self, credentials: Dict[str, Any]) -> str:
+        path = os.path.join(os.path.dirname(TERMINAL_PATH), "config", "start.ini")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        body = "\n".join(
+            [
+                "[Common]",
+                "Login=%s" % credentials.get("login"),
+                "Password=%s" % credentials.get("password"),
+                "Server=%s" % credentials.get("server"),
+                "KeepPrivate=1",
+                "CertInstall=0",
+                "NewsEnable=0",
+                "ProxyEnable=0",
+                "",
+                "[Experts]",
+                "AllowLiveTrading=1",
+                "AllowDllImport=1",
+                "Enabled=1",
+                "Account=0",
+                "",
+                "[StartUp]",
+                "",
+                "",
+            ]
+        )
+        with open(path, "w", encoding="utf-16") as fh:
+            fh.write(body)
+        return path
+
+    def _restart_with_experts(self, credentials: Dict[str, Any]) -> bool:
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "terminal64.exe"],
+                capture_output=True,
+                text=True,
+                timeout=25,
+            )
+        except Exception:
+            pass
+        time.sleep(3)
+        try:
+            ini = self._write_start_ini(credentials)
+            subprocess.Popen(
+                [TERMINAL_PATH, "/portable", "/config:" + ini],
+                cwd=os.path.dirname(TERMINAL_PATH),
+                close_fds=True,
+            )
+        except Exception:
+            return False
+        deadline = time.time() + 100
+        while time.time() < deadline:
+            time.sleep(3)
+            try:
+                if mt5.initialize(path=TERMINAL_PATH, timeout=15000, portable=True):
+                    ai = mt5.account_info()
+                    ti = mt5.terminal_info()
+                    if (
+                        ai is not None
+                        and str(ai.login) == str(credentials.get("login"))
+                        and ti is not None
+                        and bool(getattr(ti, "trade_allowed", False))
+                    ):
+                        return True
+                    mt5.shutdown()
+            except Exception:
+                pass
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        return False
+
     def _resolve(self, symbol: str) -> str:
         name = str(symbol or "").strip().upper()
         if not name or mt5 is None:
