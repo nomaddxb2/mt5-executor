@@ -34,7 +34,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\mt5
-          key: mt5-terminal-5.0.45
+          key: mt5-terminal-6231
 
       - name: Install MetaTrader 5
         if: steps.mt5-cache.outputs.cache-hit != 'true'
