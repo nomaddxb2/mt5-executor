@@ -1,4 +1,3 @@
-import glob
 import json
 import os
 import subprocess
@@ -14,13 +13,16 @@ LOGIN = os.environ.get("MT5_TEST_LOGIN", "")
 PASSWORD = os.environ.get("MT5_TEST_PASSWORD", "")
 SERVER = os.environ.get("MT5_TEST_SERVER", "")
 TRADE = os.environ.get("MT5_DIAG_TRADE", "0") == "1"
+STATE = os.path.join(FILES, "bridge_state.json")
+CMD = os.path.join(FILES, "bridge_cmd.json")
+RES = os.path.join(FILES, "bridge_res.json")
 
 
 def out(*args):
     print(*args, flush=True)
 
 
-def read_text(path, limit=6000):
+def read_text(path, limit=8000):
     for enc in ("utf-16", "utf-8-sig", "utf-8"):
         try:
             with open(path, "r", encoding=enc, errors="replace") as fh:
@@ -28,6 +30,14 @@ def read_text(path, limit=6000):
         except (UnicodeError, OSError):
             continue
     return ""
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
 
 
 def wait_file(path, timeout, label):
@@ -39,6 +49,24 @@ def wait_file(path, timeout, label):
         time.sleep(2)
     out(label, "timeout", path)
     return False
+
+
+def send(cmd, label, timeout=30):
+    try:
+        os.remove(RES)
+    except OSError:
+        pass
+    with open(CMD, "w", encoding="utf-8") as fh:
+        json.dump(cmd, fh)
+    out("sent", label, cmd.get("id"))
+    if not wait_file(RES, timeout, label + " result"):
+        return {}
+    body = read_text(RES, 2000)
+    out(label, "result", body)
+    try:
+        return json.loads(body)
+    except Exception:
+        return {}
 
 
 out("python", sys.version)
@@ -60,15 +88,25 @@ out("copied ea", dst, os.path.getsize(dst))
 clog = os.path.join(DATA, "ea_compile.log")
 res = subprocess.run(
     [METAEDITOR, "/compile:" + dst, "/log:" + clog],
+    cwd=DATA,
     capture_output=True,
     text=True,
     timeout=120,
 )
 out("compile rc", res.returncode)
 out("compile log", read_text(clog, 4000))
-out("ex5 exists", os.path.exists(os.path.join(EXPERTS, "BridgeEA.ex5")))
+ex5 = os.path.join(EXPERTS, "BridgeEA.ex5")
+out("ex5 exists", os.path.exists(ex5), os.path.getsize(ex5) if os.path.exists(ex5) else 0)
+if not os.path.exists(ex5):
+    sys.exit(2)
 
-cfg = os.path.join(DATA, "config", "common.ini")
+for name in ("accounts.dat", "accounts.ini", "common.ini.bak"):
+    try:
+        os.remove(os.path.join(DATA, "config", name))
+    except OSError:
+        pass
+
+cfg = os.path.join(DATA, "config", "start.ini")
 with open(cfg, "w", encoding="utf-16") as fh:
     fh.write(
         "[Common]\nLogin=%s\nPassword=%s\nServer=%s\n"
@@ -79,65 +117,68 @@ with open(cfg, "w", encoding="utf-16") as fh:
     )
 out("wrote utf-16", cfg, "bytes", os.path.getsize(cfg))
 
-for name in ("bridge_cmd.json", "bridge_res.json", "bridge_state.json"):
+for path in (CMD, RES, STATE):
     try:
-        os.remove(os.path.join(FILES, name))
+        os.remove(path)
     except OSError:
         pass
 
-proc = subprocess.Popen([TERMINAL, "/portable", "/config:" + cfg], cwd=DATA)
+proc = subprocess.Popen(
+    [
+        TERMINAL,
+        "/portable",
+        "/config:" + cfg,
+        "/login:" + LOGIN,
+        "/password:" + PASSWORD,
+        "/server:" + SERVER,
+    ],
+    cwd=DATA,
+)
 out("started pid", proc.pid)
 
-state_path = os.path.join(FILES, "bridge_state.json")
-have_state = wait_file(state_path, 150, "state")
-if have_state:
-    out("state", read_text(state_path, 2000))
-else:
-    out("terminal log", read_text(os.path.join(DATA, "logs", "20261109.log"), 6000))
+have_state = wait_file(STATE, 150, "state")
+state = read_json(STATE)
+out("state initial", json.dumps(state))
 
-if TRADE and have_state:
-    cmd = {
-        "id": "diag-open-1",
-        "op": "open",
-        "symbol": "EURUSD",
-        "volume": 0.01,
-        "type": "buy",
-        "price": 0,
-        "sl": 0,
-        "tp": 0,
-        "comment": "bridge diag",
-    }
-    with open(os.path.join(FILES, "bridge_cmd.json"), "w", encoding="utf-8") as fh:
-        json.dump(cmd, fh)
-    out("wrote open command")
-    respath = os.path.join(FILES, "bridge_res.json")
-    if wait_file(respath, 30, "open result"):
-        body = read_text(respath, 2000)
-        out("open result", body)
-        try:
-            data = json.loads(body)
-            ticket = data.get("order") or data.get("deal")
-        except Exception:
-            ticket = None
-        if ticket:
-            close = {
+deadline = time.time() + 120
+while TRADE and time.time() < deadline:
+    if state.get("login") and state.get("trade_allowed"):
+        break
+    time.sleep(5)
+    state = read_json(STATE)
+out("state settled", json.dumps(state))
+
+if TRADE and state.get("login") and state.get("trade_allowed"):
+    opened = send(
+        {
+            "id": "diag-open-1",
+            "op": "open",
+            "symbol": "EURUSD",
+            "volume": 0.01,
+            "type": "buy",
+            "price": 0,
+            "sl": 0,
+            "tp": 0,
+            "comment": "bridge diag",
+        },
+        "open",
+    )
+    ticket = opened.get("order") or opened.get("deal")
+    if ticket:
+        send(
+            {
                 "id": "diag-close-1",
                 "op": "close",
                 "symbol": "EURUSD",
                 "ticket": ticket,
                 "volume": 0.01,
                 "type": "sell",
-            }
-            try:
-                os.remove(respath)
-            except OSError:
-                pass
-            with open(os.path.join(FILES, "bridge_cmd.json"), "w", encoding="utf-8") as fh:
-                json.dump(close, fh)
-            out("wrote close command", ticket)
-            if wait_file(respath, 30, "close result"):
-                out("close result", read_text(respath, 2000))
-    out("state after", read_text(state_path, 2000))
+            },
+            "close",
+        )
+    out("state after", json.dumps(read_json(STATE)))
+else:
+    out("skipping trade", "login", state.get("login"), "trade_allowed", state.get("trade_allowed"))
 
 out("=== terminal log")
 out(read_text(os.path.join(DATA, "logs", "20261109.log"), 8000))
