@@ -89,9 +89,7 @@ class TerminalPool:
         except Exception:
             pass
         started = time.time()
-        if not self._terminal_running():
-            self._launch_terminal()
-        timeout_ms = int(os.environ.get("MT5_CONNECT_TIMEOUT_MS", "90000"))
+        timeout_ms = int(os.environ.get("MT5_CONNECT_TIMEOUT_MS", "120000"))
         last_code, last_message = -1, "unknown"
         ok = False
         for attempt in range(3):
