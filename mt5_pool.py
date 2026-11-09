@@ -6,7 +6,7 @@ import glob
 import os
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 try:
@@ -47,6 +47,21 @@ def _num(value: Any, digits: int = 2) -> Any:
         return round(float(value), digits)
     except Exception:
         return value
+
+
+def _timeframe(name: str):
+    if mt5 is None:
+        return None
+    table = {
+        "M1": mt5.TIMEFRAME_M1,
+        "M5": mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15,
+        "M30": mt5.TIMEFRAME_M30,
+        "H1": mt5.TIMEFRAME_H1,
+        "H4": mt5.TIMEFRAME_H4,
+        "D1": mt5.TIMEFRAME_D1,
+    }
+    return table.get(str(name or "M15").upper())
 
 
 def _side(order_type: int) -> str:
@@ -398,6 +413,76 @@ class TerminalPool:
                 }
             )
         return {"prices": out, "count": len(out), "mode": "live"}
+
+    def rates(self, credentials: Dict[str, Any], symbol: str, timeframe: str = "M15", count: int = 300) -> List[Dict[str, Any]]:
+        self._ensure(credentials)
+        if self.dry_run or mt5 is None:
+            return []
+        broker = self._resolve(symbol)
+        tf = _timeframe(timeframe)
+        if tf is None:
+            raise Mt5Error("Unsupported timeframe: %s" % timeframe, "invalid_timeframe")
+        mt5.symbol_select(broker, True)
+        rows = mt5.copy_rates_from_pos(broker, tf, 0, int(count))
+        if rows is None:
+            code, message = mt5.last_error()
+            raise Mt5Error("copy_rates failed for %s: %s" % (broker, message), "rates_failed", {"code": code})
+        out = []
+        for row in rows:
+            out.append({
+                "time": _iso(int(row["time"])),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "tickVolume": float(row["tick_volume"]),
+                "spread": float(row["spread"]),
+            })
+        return out
+
+    def spec(self, credentials: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+        self._ensure(credentials)
+        if self.dry_run or mt5 is None:
+            return {
+                "symbol": symbol, "digits": 5, "point": 0.00001,
+                "tickSize": 0.00001, "tickValue": 1.0, "contractSize": 100000.0,
+                "volumeMin": 0.01, "volumeMax": 100.0, "volumeStep": 0.01,
+            }
+        broker = self._resolve(symbol)
+        info = mt5.symbol_info(broker)
+        if info is None:
+            raise Mt5Error("Symbol not found: %s" % broker, "symbol_not_found")
+        d = info._asdict()
+        return {
+            "symbol": broker,
+            "digits": int(d.get("digits") or 5),
+            "point": float(d.get("point") or 0.00001),
+            "tickSize": float(d.get("trade_tick_size") or d.get("point") or 0.00001),
+            "tickValue": float(d.get("trade_tick_value") or 1.0),
+            "contractSize": float(d.get("trade_contract_size") or 100000.0),
+            "volumeMin": float(d.get("volume_min") or 0.01),
+            "volumeMax": float(d.get("volume_max") or 100.0),
+            "volumeStep": float(d.get("volume_step") or 0.01),
+        }
+
+    def deal_result(self, credentials: Dict[str, Any], ticket: Any) -> Dict[str, Any]:
+        self._ensure(credentials)
+        if self.dry_run or mt5 is None:
+            return {"ticket": ticket, "profit": 0.0, "deals": 0}
+        rows = []
+        try:
+            rows = mt5.history_deals_get(position=int(ticket)) or []
+        except TypeError:
+            now = datetime.now(timezone.utc)
+            rows = [d for d in (mt5.history_deals_get(now - timedelta(days=30), now) or [])
+                    if int(getattr(d, "position_id", 0) or 0) == int(ticket)]
+        profit = 0.0
+        for d in rows:
+            try:
+                profit += float(d.profit) + float(d.commission) + float(d.swap)
+            except Exception:
+                continue
+        return {"ticket": ticket, "profit": round(profit, 2), "deals": len(rows)}
 
     # ---------------------------------------------------------------- writes
     def open_position(self, credentials: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:

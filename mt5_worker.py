@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional
 import requests
 
 from mt5_pool import Mt5Error, TerminalPool, WATCHLIST
+from ai_engine import AIAgent
 
 API = (os.environ.get("MT5_API_URL") or "").rstrip("/")
 SECRET = os.environ.get("MT5_WORKER_SECRET") or ""
@@ -25,14 +26,18 @@ SHARD = int(os.environ.get("MT5_SHARD", "0"))
 SHARDS = int(os.environ.get("MT5_SHARDS", "1"))
 DURATION = int(os.environ.get("MT5_DURATION_SECONDS", "20700"))
 POLL = float(os.environ.get("MT5_POLL_SECONDS", "5"))
-SNAPSHOT_INTERVAL = float(os.environ.get("MT5_SNAPSHOT_SECONDS", "30"))
+SNAPSHOT_INTERVAL = float(os.environ.get("MT5_SNAPSHOT_SECONDS", "1"))
 DRY_RUN = os.environ.get("MT5_DRY_RUN") == "1"
+AI_ENABLED = os.environ.get("MT5_AI_ENABLED", "1") == "1"
+AI_INTERVAL = float(os.environ.get("MT5_AI_INTERVAL", "5"))
+AI_SHARD = int(os.environ.get("MT5_AI_SHARD", "0"))
 
 HEADERS = {"X-Worker-Secret": SECRET, "Content-Type": "application/json"}
 WAKE = threading.Event()
 STOP = threading.Event()
 ACTIVE: Dict[str, Dict[str, Any]] = {}
 ACTIVE_LOCK = threading.Lock()
+POOL_LOCK = threading.RLock()
 
 
 def log(message: str) -> None:
@@ -104,10 +109,42 @@ def execute(pool: TerminalPool, job: Dict[str, Any], creds: Dict[str, Any]) -> A
 
 def push_snapshot(pool: TerminalPool, account_id: str, creds: Dict[str, Any]) -> None:
     try:
-        snap = pool.snapshot(creds)
+        with POOL_LOCK:
+            snap = pool.snapshot(creds)
         api("/v1/worker/snapshot", body={"accountId": account_id, "snapshot": snap})
     except Exception as e:
         log("snapshot failed for %s: %s" % (account_id, e))
+
+
+def ai_account_seen(account_id: str, creds: Dict[str, Any]) -> None:
+    with ACTIVE_LOCK:
+        ACTIVE[account_id] = creds
+    pool = pool_ref[0]
+    if pool is not None:
+        push_snapshot(pool, account_id, creds)
+
+
+pool_ref: list = [None]
+
+
+def ai_loop(pool: TerminalPool) -> None:
+    if not AI_ENABLED:
+        log("ai engine disabled")
+        return
+    if SHARD != AI_SHARD:
+        log("ai engine skipped on shard %s (owner shard %s)" % (SHARD, AI_SHARD))
+        return
+    pool_ref[0] = pool
+    agent = AIAgent(
+        pool,
+        lambda path, body: api(path, body=body, timeout=90),
+        log,
+        lock=POOL_LOCK,
+        interval=AI_INTERVAL,
+        on_account=ai_account_seen,
+    )
+    log("ai engine online interval=%ss magic=20261109" % AI_INTERVAL)
+    agent.run_forever(STOP)
 
 
 def process(pool: TerminalPool, claimed: Dict[str, Any]) -> None:
@@ -120,7 +157,8 @@ def process(pool: TerminalPool, claimed: Dict[str, Any]) -> None:
     try:
         if not creds:
             raise Mt5Error("Missing credentials for job", "credential_error")
-        result = execute(pool, job, creds)
+        with POOL_LOCK:
+            result = execute(pool, job, creds)
         if op == "snapshot":
             api("/v1/worker/snapshot", body={"accountId": account_id, "snapshot": result})
             result = {"saved": True}
@@ -162,7 +200,8 @@ def heartbeat_loop(pool: TerminalPool) -> None:
                     "shard": SHARD,
                     "shards": SHARDS,
                     "accounts": accounts,
-                    "version": "1.0.0",
+                    "version": "1.1.0",
+                    "ai": AI_ENABLED,
                     "dryRun": DRY_RUN,
                 },
             )
@@ -257,6 +296,7 @@ def main() -> int:
     threading.Thread(target=heartbeat_loop, args=(pool,), daemon=True).start()
     threading.Thread(target=snapshot_loop, args=(pool,), daemon=True).start()
     threading.Thread(target=realtime_loop, daemon=True).start()
+    threading.Thread(target=ai_loop, args=(pool,), daemon=True).start()
 
     deadline = time.time() + DURATION
     processed = 0
