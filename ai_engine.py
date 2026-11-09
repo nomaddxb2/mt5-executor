@@ -239,7 +239,8 @@ def _digits(price: float) -> int:
 
 # ---------------------------------------------------------------- analysis
 def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dict[str, Any],
-                   weights: Dict[str, float], params: Dict[str, Any]) -> Dict[str, Any]:
+                   weights: Dict[str, float], params: Dict[str, Any],
+                   flow: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     m15 = [c for c in (tfs.get("M15") or []) if c]
     if len(m15) < 60:
         m15 = [c for c in (tfs.get("M5") or []) if c]
@@ -374,6 +375,26 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
         hold_reason = "No live quote"
         side = None
 
+    flow = flow or {}
+    flow_available = bool(flow.get("available"))
+    flow_score = float(flow.get("score") or 0.0)
+    flow_alignment = 0.0
+    if flow_available:
+        reasons.append("Orderflow %s: score %+.2f · depth %+.2f · tick delta %+.2f" % (
+            flow.get("pressure") or "balanced",
+            flow_score,
+            float(flow.get("depthImbalance") or 0.0),
+            float(flow.get("tickDeltaRatio") or 0.0),
+        ))
+        if side:
+            flow_alignment = flow_score if side == "buy" else -flow_score
+            confidence = _clamp(confidence + flow_alignment * 0.10, 0.0, 1.0)
+            if flow_alignment < -0.30:
+                hold_reason = "Orderflow opposes %s: %s" % (side.upper(), flow.get("pressure") or "heavy opposite pressure")
+                side = None
+            elif flow_alignment > 0.15:
+                reasons.append("Orderflow confirms %s (alignment %+.2f)" % (side.upper(), flow_alignment))
+
     digits = _digits(price)
     sl = tp = None
     if side:
@@ -423,6 +444,15 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
         "holdReason": hold_reason,
         "summary": summary,
         "weights": {k: round(v, 4) for k, v in w.items()},
+        "flowAvailable": flow_available,
+        "flowScore": round(flow_score, 3),
+        "flowAlignment": round(flow_alignment, 3),
+        "flowPressure": flow.get("pressure"),
+        "depthImbalance": flow.get("depthImbalance"),
+        "tickDeltaRatio": flow.get("tickDeltaRatio"),
+        "bidDepth": flow.get("bidDepth"),
+        "askDepth": flow.get("askDepth"),
+        "flowNotes": flow.get("notes") or [],
     }
 
 
@@ -560,18 +590,34 @@ def initial_state() -> Dict[str, Any]:
         "lastHoldAt": {},
         "lastRiskHoldAt": {},
         "startingEquity": None,
+        "peakEquity": None,
+        "komz": {
+            "name": "Komz",
+            "enabled": False,
+            "available": False,
+            "model": None,
+            "lastReview": None,
+            "lastResearchAt": None,
+            "research": [],
+            "lessons": [],
+            "riskBias": 0.0,
+            "recovery": {"active": False, "drawdownPct": 0.0, "riskMultiplier": 1.0},
+            "compounding": {"active": False},
+            "memory": {"telegram": False, "supabase": False, "chunks": 0},
+        },
     }
 
 
 # ---------------------------------------------------------------- agent
 class AIAgent:
-    def __init__(self, pool, api, log, lock=None, interval: float = 5.0, on_account=None):
+    def __init__(self, pool, api, log, lock=None, interval: float = 5.0, on_account=None, brain=None):
         self.pool = pool
         self.api = api
         self.log = log
         self.lock = lock
         self.interval = interval
         self.on_account = on_account
+        self.brain = brain
         self.accounts: List[Dict[str, Any]] = []
         self.last_refresh = 0.0
         self.cycle = 0
@@ -622,6 +668,7 @@ class AIAgent:
         cfg = row.get("config") or {}
         creds = row.get("credentials") or {}
         account_id = row.get("accountId")
+        use_brain = bool(self.brain and cfg.get("komz", True))
         if not account_id or not creds or not cfg.get("enabled"):
             return
         state = row.get("state") or initial_state()
@@ -634,6 +681,13 @@ class AIAgent:
         state.setdefault("positions", [])
         state.setdefault("lastTradeAt", {})
         state.setdefault("lastHoldAt", {})
+        state.setdefault("lastRiskHoldAt", {})
+        komz_state = state.setdefault("komz", initial_state()["komz"])
+        if self.brain:
+            try:
+                komz_state.update(self.brain.status())
+            except Exception as e:
+                self.log("komz status failed: %s" % e)
         params = dict(DEFAULT_PARAMS)
         params.update(state.get("params") or {})
         for key in ("riskPct", "maxPositions", "minConfidence", "maxDailyLossPct"):
@@ -650,6 +704,7 @@ class AIAgent:
         command = cfg.get("command")
         if command == "reset":
             state = initial_state()
+            komz_state = state["komz"]
             state["mode"] = "dry-run" if dry else "live"
             state["commandAck"] = "reset"
             state["thoughts"].append({"at": _iso(), "text": "Learning state reset by operator."})
@@ -696,13 +751,18 @@ class AIAgent:
                     spec = self.pool.spec(creds, sym) or {}
                 except Exception:
                     spec = {}
-                market[sym] = {"tfs": tfs, "quote": quote, "spec": spec}
+                flow = {}
+                try:
+                    flow = self.pool.orderflow(creds, sym, quote) or {}
+                except Exception:
+                    flow = {}
+                market[sym] = {"tfs": tfs, "quote": quote, "spec": spec, "flow": flow}
 
         equity = float(info.get("equity") or info.get("balance") or 0)
         if state.get("startingEquity") is None:
             state["startingEquity"] = equity
 
-        rows = [analyze_symbol(sym, m["tfs"], m["quote"], weights, params) for sym, m in market.items()]
+        rows = [analyze_symbol(sym, m["tfs"], m["quote"], weights, params, m.get("flow")) for sym, m in market.items()]
         rows.sort(key=lambda r: r.get("confidence") or 0, reverse=True)
         by_symbol = {r.get("symbol"): r for r in rows if r.get("ok")}
 
@@ -758,6 +818,17 @@ class AIAgent:
                 "outcome": "win" if pnl > 0 else "loss" if pnl < 0 else "flat",
                 "pnl": round(pnl, 2),
             })
+
+        if closed_now and use_brain:
+            try:
+                lesson = self.brain.reflect(account_id, cfg, state, closed_now[0], info)
+                if lesson:
+                    state.setdefault("thoughts", []).append({
+                        "at": _iso(),
+                        "text": "Komz reflection: %s" % (lesson.get("lesson") or lesson.get("nextAction") or "trade reviewed"),
+                    })
+            except Exception as e:
+                self.log("komz reflection failed: %s" % e)
 
         # manage open positions
         kept: List[Dict[str, Any]] = []
@@ -854,9 +925,34 @@ class AIAgent:
         state["halted"] = halted
         cooldown_until = float(state.get("cooldownUntil") or 0)
 
+        peak = max(float(state.get("peakEquity") or equity or 0), float(equity or 0))
+        state["peakEquity"] = peak
+        drawdown_pct = ((peak - equity) / peak * 100.0) if peak else 0.0
+        risk_mult = 1.0
+        if drawdown_pct >= 10.0:
+            risk_mult = 0.25
+        elif drawdown_pct >= 5.0:
+            risk_mult = 0.5
+        elif drawdown_pct >= 2.5:
+            risk_mult = 0.75
+        komz_state["recovery"] = {
+            "active": risk_mult < 1.0,
+            "drawdownPct": round(drawdown_pct, 2),
+            "riskMultiplier": risk_mult,
+            "peakEquity": round(peak, 2),
+        }
+        start_equity = float(state.get("startingEquity") or equity or 0)
+        komz_state["compounding"] = {
+            "active": bool(start_equity and equity > start_equity),
+            "startingEquity": round(start_equity, 2),
+            "gainPct": round(((equity / start_equity) - 1.0) * 100.0, 2) if start_equity else 0.0,
+        }
+        risk_pct = float(params.get("riskPct", 0.5)) * risk_mult
+
         # open new positions
         open_count = len(state["positions"])
         open_symbols = {_base(p.get("symbol")) for p in state["positions"]}
+        reviewed = False
         for cand in rows:
             if not cand.get("ok") or not cand.get("side"):
                 continue
@@ -876,7 +972,7 @@ class AIAgent:
             price = float(cand.get("ask") if cand.get("side") == "buy" else cand.get("bid"))
             sl = float(cand.get("sl") or 0)
             sl_dist = abs(price - sl)
-            lots = position_size(equity, float(params.get("riskPct", 0.5)), sl_dist, spec)
+            lots = position_size(equity, risk_pct, sl_dist, spec)
             if lots <= 0:
                 continue
             tick_value = float(spec.get("tickValue") or 1.0)
@@ -896,6 +992,27 @@ class AIAgent:
                     })
                     state.setdefault("lastRiskHoldAt", {})[sym] = now
                 continue
+            review = None
+            if use_brain and not reviewed:
+                reviewed = True
+                try:
+                    review = self.brain.review_entry(account_id, cfg, state, cand, market, info)
+                except Exception as e:
+                    self.log("komz review failed: %s" % e)
+                if review:
+                    komz_state["lastReview"] = review
+                    if review.get("action") == "reject":
+                        state["decisions"].append({
+                            "id": "k%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
+                            "symbol": sym, "side": None, "confidence": cand.get("confidence"),
+                            "price": price, "volume": lots,
+                            "reason": "Komz veto: %s%s" % (
+                                review.get("reason") or "setup rejected",
+                                (" · " + review.get("riskNote")) if review.get("riskNote") else "",
+                            ),
+                        })
+                        continue
+                    cand["komzReview"] = review
             if dry:
                 state["decisions"].append({
                     "id": "d%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
@@ -932,7 +1049,9 @@ class AIAgent:
                 "id": "o%d" % int(time.time() * 1000), "at": _iso(),
                 "action": cand.get("side"), "symbol": sym, "side": cand.get("side"),
                 "confidence": cand.get("confidence"), "price": fill, "volume": lots,
-                "reason": " ".join(cand.get("reasons") or []),
+                "reason": " ".join(cand.get("reasons") or []) + (
+                    (" · Komz: " + str((cand.get("komzReview") or {}).get("reason") or "")) if cand.get("komzReview") else ""
+                ),
                 "ticket": ticket, "outcome": None, "pnl": None,
             }
             state["decisions"].append(decision)
@@ -962,6 +1081,22 @@ class AIAgent:
                 state["lastHoldKey"] = key
                 state.setdefault("lastHoldAt", {})[top.get("symbol")] = now
 
+        if use_brain:
+            try:
+                note = self.brain.research(account_id, cfg, state, market, rows, info)
+                if note:
+                    state.setdefault("thoughts", []).append({
+                        "at": _iso(),
+                        "text": "Komz research: %s · %s. %s" % (
+                            note.get("regime"), note.get("bias"), " ".join((note.get("notes") or [])[:2])),
+                    })
+            except Exception as e:
+                self.log("komz research failed: %s" % e)
+            try:
+                komz_state.update(self.brain.status())
+            except Exception:
+                pass
+
         # stats + learning
         closed = state.get("closed") or []
         stats = compute_stats(closed, float(state.get("startingEquity") or equity))
@@ -988,7 +1123,7 @@ class AIAgent:
         state["equity"] = round(equity, 2)
         state["balance"] = round(float(info.get("balance") or 0), 2)
         state["market"] = [
-            {k: r.get(k) for k in ("symbol", "price", "bid", "ask", "spread", "rsi", "atr", "atrPct", "trend", "regime", "score", "confidence", "side", "holdReason")}
+            {k: r.get(k) for k in ("symbol", "price", "bid", "ask", "spread", "rsi", "atr", "atrPct", "trend", "regime", "score", "confidence", "side", "holdReason", "flowAvailable", "flowScore", "flowAlignment", "flowPressure", "depthImbalance", "tickDeltaRatio", "bidDepth", "askDepth")}
             for r in rows if r.get("ok")
         ]
         if top and top.get("ok"):
@@ -998,6 +1133,7 @@ class AIAgent:
                 "confidence": top.get("confidence"),
                 "regime": top.get("regime"),
                 "summary": top.get("summary"),
+                "komz": komz_state.get("lastReview"),
                 "at": _iso(),
             }
 
