@@ -68,7 +68,6 @@ jobs:
           python -c "import MetaTrader5 as mt5; print('MetaTrader5', mt5.__version__)"
 
       - name: Diagnose MT5 IPC
-        if: ${{ vars.MT5_DIAG != '0' }}
         shell: pwsh
         timeout-minutes: 5
         continue-on-error: true
