@@ -92,7 +92,24 @@ class TerminalPool:
         timeout_ms = int(os.environ.get("MT5_CONNECT_TIMEOUT_MS", "120000"))
         last_code, last_message = -1, "unknown"
         ok = False
+        # Attach to the terminal that the warm workflow already started and logged in.
+        try:
+            ok = mt5.initialize(path=TERMINAL_PATH, timeout=timeout_ms, portable=True)
+        except Exception:
+            ok = False
+        if ok:
+            ai = mt5.account_info()
+            same_login = ai is not None and str(ai.login) == str(credentials.get("login"))
+            same_server = ai is not None and str(ai.server or "").lower() == str(credentials.get("server") or "").lower()
+            if not (same_login and same_server):
+                ok = False
+                try:
+                    mt5.shutdown()
+                except Exception:
+                    pass
         for attempt in range(3):
+            if ok:
+                break
             ok = mt5.initialize(
                 path=TERMINAL_PATH,
                 login=int(credentials.get("login")),
@@ -356,8 +373,7 @@ class TerminalPool:
             wanted = WATCHLIST
         out = []
         for name in wanted:
-            mt5.symbol_select(name, True)
-            tick = mt5.symbol_info_tick(name)
+            tick = self._tick(name)
             if tick is None:
                 continue
             info = mt5.symbol_info(name)
@@ -383,9 +399,8 @@ class TerminalPool:
         volume = float(payload.get("volume") or 0)
         if not symbol or side not in ("buy", "sell") or volume <= 0:
             raise Mt5Error("symbol, side and volume are required", "invalid_order")
-        mt5.symbol_select(symbol, True)
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None:
+        tick = self._tick(symbol)
+        if tick is None or not tick.ask:
             raise Mt5Error("No tick for %s" % symbol, "symbol_unavailable")
         price = tick.ask if side == "buy" else tick.bid
         request = {
@@ -416,7 +431,7 @@ class TerminalPool:
         volume = float(payload.get("volume") or pos.volume)
         if volume > pos.volume + 1e-9:
             raise Mt5Error("Close volume exceeds open volume", "invalid_volume")
-        tick = mt5.symbol_info_tick(pos.symbol)
+        tick = self._tick(pos.symbol)
         if tick is None:
             raise Mt5Error("No tick for %s" % pos.symbol, "symbol_unavailable")
         is_buy = pos.type == mt5.ORDER_TYPE_BUY
@@ -565,6 +580,16 @@ class TerminalPool:
         }
 
     # ---------------------------------------------------------------- helpers
+    def _tick(self, symbol: str):
+        mt5.symbol_select(symbol, True)
+        tick = None
+        for _ in range(10):
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is not None and tick.bid and tick.ask:
+                return tick
+            time.sleep(0.5)
+        return tick
+
     def _send(self, request: Dict[str, Any]):
         last = None
         for filling in (mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN):

@@ -306,26 +306,45 @@ try:
     if ok:
         ai = mt5.account_info()
         out("account", json.dumps(ai._asdict(), default=str) if ai else None)
-        tick = mt5.symbol_info_tick("EURUSD")
-        out("tick", json.dumps(tick._asdict(), default=str) if tick else None)
-        if tick:
-            req = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": "EURUSD",
-                "volume": 0.01,
-                "type": mt5.ORDER_TYPE_BUY,
-                "price": tick.ask,
-                "deviation": 50,
-                "magic": 20261109,
-                "comment": "eni py",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-            res = mt5.order_send(req)
-            out("order_send", json.dumps(res._asdict(), default=str) if res else None)
-            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                pos = mt5.positions_get()
-                out("positions", json.dumps([p._asdict() for p in (pos or [])], default=str))
+        syms = mt5.symbols_get() or []
+        names = [x.name for x in syms]
+        out("symbol count", len(names))
+        out("symbol sample", json.dumps(names[:40]))
+        target = next((n for n in names if n.upper() == "EURUSD"), None)
+        if not target:
+            target = next((n for n in names if "EURUSD" in n.upper()), None)
+        if not target and names:
+            target = names[0]
+        out("target", target)
+        if target:
+            out("select", mt5.symbol_select(target, True))
+            tick = None
+            for _ in range(12):
+                tick = mt5.symbol_info_tick(target)
+                if tick and tick.ask and tick.bid:
+                    break
+                time.sleep(1)
+            out("tick", json.dumps(tick._asdict(), default=str) if tick else None)
+            if tick and tick.ask:
+                req = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": target,
+                    "volume": 0.01,
+                    "type": mt5.ORDER_TYPE_BUY,
+                    "price": tick.ask,
+                    "deviation": 50,
+                    "magic": 20261109,
+                    "comment": "eni py",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                }
+                res = mt5.order_send(req)
+                out("order_send", json.dumps(res._asdict(), default=str) if res else None)
+                if res:
+                    out("retcode", res.retcode, res.comment)
+                if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                    pos = mt5.positions_get()
+                    out("positions", json.dumps([p._asdict() for p in (pos or [])], default=str))
         mt5.shutdown()
 except Exception as exc:
     out("mt5 attach error", exc)
