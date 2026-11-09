@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import glob
 import os
+import subprocess
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -87,20 +89,42 @@ class TerminalPool:
         except Exception:
             pass
         started = time.time()
-        ok = mt5.initialize(
-            path=TERMINAL_PATH,
-            login=int(credentials.get("login")),
-            password=str(credentials.get("password")),
-            server=str(credentials.get("server")),
-            timeout=int(os.environ.get("MT5_CONNECT_TIMEOUT_MS", "60000")),
-            portable=True,
-        )
+        if not self._terminal_running():
+            self._launch_terminal()
+        timeout_ms = int(os.environ.get("MT5_CONNECT_TIMEOUT_MS", "90000"))
+        last_code, last_message = -1, "unknown"
+        ok = False
+        for attempt in range(3):
+            ok = mt5.initialize(
+                path=TERMINAL_PATH,
+                login=int(credentials.get("login")),
+                password=str(credentials.get("password")),
+                server=str(credentials.get("server")),
+                timeout=timeout_ms,
+                portable=True,
+            )
+            if ok:
+                break
+            error = mt5.last_error()
+            if error:
+                last_code, last_message = error
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+            if attempt < 2:
+                time.sleep(10)
         if not ok:
-            code, message = mt5.last_error()
             raise Mt5Error(
-                "MT5 initialize failed: %s" % message,
+                "MT5 initialize failed: %s" % last_message,
                 "mt5_connect_failed",
-                {"code": code, "message": message, "path": TERMINAL_PATH},
+                {
+                    "code": last_code,
+                    "message": last_message,
+                    "path": TERMINAL_PATH,
+                    "terminalRunning": self._terminal_running(),
+                    "logs": self._tail_logs(),
+                },
             )
         self.current = dict(credentials)
         self.connected_at = time.time()
@@ -112,6 +136,42 @@ class TerminalPool:
             "latencyMs": int((time.time() - started) * 1000),
             "terminal": self._terminal_info(),
         }
+
+    def _terminal_running(self) -> bool:
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq terminal64.exe"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return "terminal64.exe" in (out.stdout or "")
+        except Exception:
+            return False
+
+    def _launch_terminal(self) -> None:
+        if not os.path.exists(TERMINAL_PATH):
+            raise Mt5Error("Terminal not found at %s" % TERMINAL_PATH, "mt5_missing")
+        subprocess.Popen(
+            [TERMINAL_PATH, "/portable"],
+            cwd=os.path.dirname(TERMINAL_PATH),
+            close_fds=True,
+        )
+        time.sleep(5)
+
+    def _tail_logs(self, limit: int = 20) -> List[str]:
+        try:
+            files = sorted(
+                glob.glob(os.path.join(os.path.dirname(TERMINAL_PATH), "logs", "*.log")),
+                key=os.path.getmtime,
+            )
+            if not files:
+                return []
+            with open(files[-1], "r", encoding="utf-8", errors="replace") as handle:
+                lines = handle.readlines()
+            return [line.rstrip() for line in lines[-limit:]]
+        except Exception:
+            return []
 
     def _ensure(self, credentials: Dict[str, Any]) -> None:
         if self.dry_run:

@@ -67,6 +67,14 @@ jobs:
           if (!(Test-Path 'C:\mt5\terminal64.exe')) { throw 'C:\mt5\terminal64.exe is missing' }
           python -c "import MetaTrader5 as mt5; print('MetaTrader5', mt5.__version__)"
 
+      - name: Warm terminal
+        shell: pwsh
+        run: |
+          Start-Process -FilePath 'C:\mt5\terminal64.exe' -ArgumentList '/portable' -WorkingDirectory 'C:\mt5'
+          Start-Sleep -Seconds 15
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, StartTime
+          Get-ChildItem 'C:\mt5\logs' -ErrorAction SilentlyContinue | Select-Object Name, Length
+
       - name: Run warm worker
         shell: pwsh
         env:
