@@ -196,6 +196,15 @@ if TRADE and state.get("login") and state.get("trade_allowed"):
 else:
     out("skipping trade", "login", state.get("login"), "trade_allowed", state.get("trade_allowed"))
 
+out("=== mql logs")
+mlogs = os.path.join(DATA, "MQL5", "Logs")
+try:
+    for name in sorted(os.listdir(mlogs)):
+        out("mql log", name)
+        out(read_text(os.path.join(mlogs, name), 12000))
+except OSError as exc:
+    out("mql logs listing failed", exc)
+
 out("=== config")
 try:
     for name in sorted(os.listdir(os.path.join(DATA, "config"))):
