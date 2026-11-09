@@ -13,8 +13,10 @@ int OnInit()
    g_cmdFile = InpPrefix + "_cmd.json";
    g_resFile = InpPrefix + "_res.json";
    g_stateFile = InpPrefix + "_state.json";
+   Print("BridgeEA OnInit data=", TerminalInfoString(TERMINAL_DATA_PATH), " state=", g_stateFile);
    EventSetTimer(1);
    WriteState();
+   Print("BridgeEA OnInit state done err=", GetLastError());
    return INIT_SUCCEEDED;
 }
 
@@ -27,6 +29,13 @@ void OnTimer()
 {
    WriteState();
    ReadCommand();
+   static uint last = 0;
+   uint now = GetTickCount();
+   if(now - last >= 30000)
+   {
+      Print("BridgeEA timer login=", AccountInfoInteger(ACCOUNT_LOGIN), " trade=", AccountInfoInteger(ACCOUNT_TRADE_ALLOWED), " err=", GetLastError());
+      last = now;
+   }
 }
 
 void OnTick()
@@ -49,9 +58,13 @@ string ReadAll(const string name)
 
 void WriteAll(const string name, const string body)
 {
+   ResetLastError();
    int h = FileOpen(name, FILE_WRITE | FILE_TXT | FILE_ANSI);
    if(h == INVALID_HANDLE)
+   {
+      Print("BridgeEA FileOpen failed ", name, " err=", GetLastError());
       return;
+   }
    FileWriteString(h, body);
    FileClose(h);
 }

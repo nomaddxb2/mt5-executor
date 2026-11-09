@@ -136,7 +136,22 @@ proc = subprocess.Popen(
 )
 out("started pid", proc.pid)
 
+import threading
+
+def keep_files():
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        try:
+            os.makedirs(FILES, exist_ok=True)
+        except OSError:
+            pass
+        time.sleep(2)
+
+threading.Thread(target=keep_files, daemon=True).start()
+
 have_state = wait_file(STATE, 150, "state")
+out("files dir", sorted(os.listdir(FILES)) if os.path.isdir(FILES) else "missing")
+out("experts dir", sorted(os.listdir(EXPERTS)) if os.path.isdir(EXPERTS) else "missing")
 state = read_json(STATE)
 out("state initial", json.dumps(state))
 out("login_ok", str(state.get("login")) == LOGIN, "server_ok", state.get("server") == SERVER)
