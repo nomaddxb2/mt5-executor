@@ -208,6 +208,97 @@ def ini_sections(path, wanted):
             block.append(line)
     return "\n".join(block)
 
+
+def parse_mcp(resp):
+    ct = resp.headers.get("Content-Type", "")
+    if "text/event-stream" in ct:
+        data = []
+        for line in resp.text.splitlines():
+            if line.startswith("data:"):
+                data.append(line[5:].strip())
+        for d in reversed(data):
+            try:
+                return json.loads(d)
+            except Exception:
+                pass
+        return {}
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def mcp_test():
+    import requests
+    key = ""
+    ai = read_text(os.path.join(DATA, "config", "assistant.ini"), 4000)
+    for line in ai.splitlines():
+        if line.strip().startswith("ApiKey="):
+            key = line.split("=", 1)[1].strip()
+            break
+    out("mcp key len", len(key))
+    url = "http://127.0.0.1:22346/mcp"
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "eni", "version": "1.0"}}}
+    variants = [{"Authorization": "Bearer " + key}, {"Authorization": key}, {"X-API-Key": key}, {"Api-Key": key}, {"api-key": key}, {}]
+    chosen = None
+    session = None
+    for h in variants:
+        try:
+            r = requests.post(url, json=init, headers={**h, "Content-Type": "application/json", "Accept": "application/json, text/event-stream"}, timeout=10)
+        except Exception as exc:
+            out("mcp init err", list(h), exc)
+            continue
+        out("mcp init", list(h), r.status_code, r.headers.get("Mcp-Session-Id"), r.text[:300])
+        if r.status_code == 200:
+            chosen = h
+            session = r.headers.get("Mcp-Session-Id")
+            out("mcp init body", json.dumps(parse_mcp(r))[:600])
+            break
+    if not chosen:
+        out("mcp no auth variant worked")
+        return
+    hdr = {**chosen, "Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    if session:
+        hdr["Mcp-Session-Id"] = session
+    try:
+        requests.post(url, json={"jsonrpc": "2.0", "method": "notifications/initialized"}, headers=hdr, timeout=10)
+    except Exception:
+        pass
+
+    def call(payload):
+        r = requests.post(url, json=payload, headers=hdr, timeout=20)
+        return r.status_code, parse_mcp(r), r.text[:400]
+
+    st, body, _ = call({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+    out("mcp tools status", st)
+    tools = body.get("result", {}).get("tools", [])
+    names = [t.get("name") for t in tools]
+    out("mcp tool count", len(tools))
+    out("mcp tools", json.dumps(names))
+    for name in names:
+        if name in ("trade_send_market_order", "trade_close_single_position", "trade_close_position", "trade_modify_sl_tp", "trade_send_pending_order"):
+            t = next((x for x in tools if x.get("name") == name), {})
+            out("mcp schema", name, json.dumps(t.get("inputSchema", {}))[:1500])
+    t = next((x for x in tools if x.get("name") == "trade_send_market_order"), None)
+    if t:
+        schema = t.get("inputSchema", {})
+        props = schema.get("properties", {})
+        cand = {"symbol": "EURUSD", "volume": 0.01, "type": "buy", "side": "buy", "order_type": "buy", "sl": 0, "tp": 0, "comment": "eni diag", "magic": 20261109, "deviation": 50}
+        args = {}
+        for k in props:
+            if k in cand:
+                args[k] = cand[k]
+        for k in schema.get("required", []):
+            if k not in args and k in cand:
+                args[k] = cand[k]
+        out("mcp order args", json.dumps(args))
+        st, body, _ = call({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "trade_send_market_order", "arguments": args}})
+        out("mcp order status", st)
+        out("mcp order result", json.dumps(body)[:1500])
+
+
+mcp_test()
+
 for name in ("terminal.ini", "start.ini", "common.ini"):
     out("=== ini", name)
     out(ini_sections(os.path.join(DATA, "config", name), ["Experts", "StartUp", "Common"]))
