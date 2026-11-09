@@ -67,7 +67,7 @@ jobs:
           MT5_TEST_PASSWORD: ${{ secrets.MT5_TEST_PASSWORD }}
           MT5_TEST_SERVER: ${{ secrets.MT5_TEST_SERVER }}
           MT5_DIAG_TRADE: '1'
-        run: python -u mt5_diag_login.py 2>&1 | Tee-Object -FilePath diag.log
+        run: python -u mt5_ea_diag.py 2>&1 | Tee-Object -FilePath diag.log
 
       - name: Pipe and process snapshot
         if: always()
