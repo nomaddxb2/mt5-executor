@@ -558,6 +558,7 @@ def initial_state() -> Dict[str, Any]:
         "updatedAt": _iso(),
         "lastTradeAt": {},
         "lastHoldAt": {},
+        "lastRiskHoldAt": {},
         "startingEquity": None,
     }
 
@@ -877,6 +878,23 @@ class AIAgent:
             sl_dist = abs(price - sl)
             lots = position_size(equity, float(params.get("riskPct", 0.5)), sl_dist, spec)
             if lots <= 0:
+                continue
+            tick_value = float(spec.get("tickValue") or 1.0)
+            tick_size = float(spec.get("tickSize") or 0.00001)
+            risk_per_lot = sl_dist * (tick_value / tick_size) if tick_size else sl_dist * 100000.0
+            actual_risk = risk_per_lot * lots
+            risk_cap = max(0.0, equity * 0.02)
+            if actual_risk > risk_cap:
+                last_risk = float((state.get("lastRiskHoldAt") or {}).get(sym) or 0)
+                if now - last_risk > 300:
+                    state["decisions"].append({
+                        "id": "r%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
+                        "symbol": sym, "side": None, "confidence": cand.get("confidence"),
+                        "price": price, "volume": lots,
+                        "reason": "Min-lot risk $%.2f is %.1f%% of equity, above the 2.0%% hard cap. Skipping %s." % (
+                            actual_risk, (actual_risk / equity * 100.0) if equity else 0, sym),
+                    })
+                    state.setdefault("lastRiskHoldAt", {})[sym] = now
                 continue
             if dry:
                 state["decisions"].append({
