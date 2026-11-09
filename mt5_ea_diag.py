@@ -139,6 +139,7 @@ out("started pid", proc.pid)
 have_state = wait_file(STATE, 150, "state")
 state = read_json(STATE)
 out("state initial", json.dumps(state))
+out("login_ok", str(state.get("login")) == LOGIN, "server_ok", state.get("server") == SERVER)
 
 deadline = time.time() + 120
 while TRADE and time.time() < deadline:
@@ -180,5 +181,14 @@ if TRADE and state.get("login") and state.get("trade_allowed"):
 else:
     out("skipping trade", "login", state.get("login"), "trade_allowed", state.get("trade_allowed"))
 
+out("=== config")
+try:
+    for name in sorted(os.listdir(os.path.join(DATA, "config"))):
+        p = os.path.join(DATA, "config", name)
+        out(name, os.path.getsize(p))
+except OSError as exc:
+    out("config listing failed", exc)
+out("origin", read_text(os.path.join(DATA, "origin.txt"), 2000))
+
 out("=== terminal log")
-out(read_text(os.path.join(DATA, "logs", "20261109.log"), 8000))
+out(read_text(os.path.join(DATA, "logs", "20261109.log"), 40000))

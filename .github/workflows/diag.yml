@@ -26,32 +26,32 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\mt5
-          key: mt5-terminal-6231
+          key: mt5-exness-6314
 
       - name: Install MetaTrader 5
         if: steps.mt5-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $setup = Join-Path $env:RUNNER_TEMP 'mt5setup.exe'
-          Invoke-WebRequest -Uri 'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe' -OutFile $setup
+          $setup = Join-Path $env:RUNNER_TEMP 'exness5setup.exe'
+          Invoke-WebRequest -Uri 'https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe' -OutFile $setup
           Start-Process -FilePath $setup -ArgumentList '/auto' -Wait
-          $candidates = @(
-            'C:\Program Files\MetaTrader 5',
-            'C:\Program Files\MetaTrader 5 Terminal',
-            (Join-Path $env:LOCALAPPDATA 'Programs\MetaTrader 5')
-          )
+          $roots = @('C:\Program Files', 'C:\Program Files (x86)', (Join-Path $env:LOCALAPPDATA 'Programs'))
           $src = $null
-          for ($i = 0; $i -lt 30 -and -not $src; $i++) {
-            $src = $candidates | Where-Object { Test-Path (Join-Path $_ 'terminal64.exe') } | Select-Object -First 1
+          for ($i = 0; $i -lt 45 -and -not $src; $i++) {
+            $src = Get-ChildItem -Path $roots -Recurse -Depth 3 -Filter 'terminal64.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $src) { Start-Sleep -Seconds 2 }
           }
           if (-not $src) {
             Get-ChildItem 'C:\Program Files' -Directory | Select-Object -ExpandProperty FullName
-            throw 'MetaTrader 5 installation did not produce terminal64.exe'
+            throw 'Exness MetaTrader 5 installation did not produce terminal64.exe'
           }
+          $dir = $src.Directory.FullName
+          Write-Host "found terminal at $dir"
           New-Item -ItemType Directory -Force -Path 'C:\mt5' | Out-Null
-          Copy-Item (Join-Path $src '*') 'C:\mt5' -Recurse -Force
+          Copy-Item (Join-Path $dir '*') 'C:\mt5' -Recurse -Force
           Get-Item 'C:\mt5\terminal64.exe' | Select-Object FullName, Length
+          Get-Item 'C:\mt5\config\servers.dat' -ErrorAction SilentlyContinue | Select-Object Name, Length
+          Get-Content 'C:\mt5\origin.txt' -ErrorAction SilentlyContinue
 
       - name: Verify terminal
         shell: pwsh
@@ -76,6 +76,8 @@ jobs:
           Get-Process terminal64 -ErrorAction SilentlyContinue | Select-Object Id,Path,StartTime | Format-List
           Get-ChildItem \\.\pipe\ | Where-Object { $_.Name -like '*MT5*' } | Select-Object -ExpandProperty Name
           Get-ChildItem 'C:\mt5\logs' -ErrorAction SilentlyContinue | Select-Object Name,Length
+          Get-ChildItem 'C:\mt5\config' -ErrorAction SilentlyContinue | Select-Object Name,Length
+          Get-Content 'C:\mt5\origin.txt' -ErrorAction SilentlyContinue
 
       - name: Upload diag log
         if: always()
@@ -83,3 +85,8 @@ jobs:
         with:
           name: mt5-diag
           path: diag.log
+
+      - name: Kill terminal
+        if: always()
+        shell: pwsh
+        run: Stop-Process -Name terminal64 -Force -ErrorAction SilentlyContinue
