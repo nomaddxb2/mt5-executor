@@ -43,10 +43,23 @@ jobs:
           $setup = Join-Path $env:RUNNER_TEMP 'mt5setup.exe'
           Invoke-WebRequest -Uri 'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe' -OutFile $setup
           Start-Process -FilePath $setup -ArgumentList '/auto' -Wait
-          $src = 'C:\Program Files\MetaTrader 5'
-          if (!(Test-Path (Join-Path $src 'terminal64.exe'))) { throw 'MetaTrader 5 installation did not produce terminal64.exe' }
+          $candidates = @(
+            'C:\Program Files\MetaTrader 5',
+            'C:\Program Files\MetaTrader 5 Terminal',
+            (Join-Path $env:LOCALAPPDATA 'Programs\MetaTrader 5')
+          )
+          $src = $null
+          for ($i = 0; $i -lt 30 -and -not $src; $i++) {
+            $src = $candidates | Where-Object { Test-Path (Join-Path $_ 'terminal64.exe') } | Select-Object -First 1
+            if (-not $src) { Start-Sleep -Seconds 2 }
+          }
+          if (-not $src) {
+            Get-ChildItem 'C:\Program Files' -Directory | Select-Object -ExpandProperty FullName
+            throw 'MetaTrader 5 installation did not produce terminal64.exe'
+          }
           New-Item -ItemType Directory -Force -Path 'C:\mt5' | Out-Null
           Copy-Item (Join-Path $src '*') 'C:\mt5' -Recurse -Force
+          Get-Item 'C:\mt5\terminal64.exe' | Select-Object FullName, Length
 
       - name: Verify terminal
         shell: pwsh
