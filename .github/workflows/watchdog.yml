@@ -1,0 +1,33 @@
+name: mt5-watchdog
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch warm worker if none is online
+        shell: bash
+        env:
+          MT5_API_URL: ${{ secrets.MT5_API_URL }}
+          MT5_DISPATCH_TOKEN: ${{ secrets.MT5_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          health="$(curl -fsS "$MT5_API_URL/v1/health")"
+          online="$(printf '%s' "$health" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("warm",{}).get("online",0))')"
+          echo "warm workers online: $online"
+          if [ "$online" -lt 1 ]; then
+            curl -fsS -X POST "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+              -H "Authorization: Bearer $MT5_DISPATCH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -d '{"event_type":"mt5-warm"}'
+            echo "dispatched mt5-warm"
+          fi
