@@ -305,9 +305,9 @@ try:
     out("initialize", ok, mt5.last_error())
     if ok:
         ai = mt5.account_info()
-        out("account", ai._asdict() if ai else None)
+        out("account", json.dumps(ai._asdict(), default=str) if ai else None)
         tick = mt5.symbol_info_tick("EURUSD")
-        out("tick", tick._asdict() if tick else None)
+        out("tick", json.dumps(tick._asdict(), default=str) if tick else None)
         if tick:
             req = {
                 "action": mt5.TRADE_ACTION_DEAL,
@@ -322,10 +322,10 @@ try:
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
             res = mt5.order_send(req)
-            out("order_send", res._asdict() if res else None)
+            out("order_send", json.dumps(res._asdict(), default=str) if res else None)
             if res and res.retcode == mt5.TRADE_RETCODE_DONE:
                 pos = mt5.positions_get()
-                out("positions", [p._asdict() for p in (pos or [])])
+                out("positions", json.dumps([p._asdict() for p in (pos or [])], default=str))
         mt5.shutdown()
 except Exception as exc:
     out("mt5 attach error", exc)
