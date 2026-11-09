@@ -90,6 +90,15 @@ jobs:
           MT5_AI_ENABLED: '1'
           MT5_AI_INTERVAL: '5'
           MT5_AI_SHARD: '0'
+          MT5_ORDERFLOW: '1'
+          KOMZ_ENABLED: '1'
+          KOMZ_MODEL: ${{ vars.KOMZ_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b' }}
+          KOMZ_REASONING: 'low'
+          KOMZ_BRAIN_INTERVAL: '90'
+          KOMZ_RESEARCH_SECONDS: '900'
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python mt5_worker.py
 
       - name: Chain next warm run

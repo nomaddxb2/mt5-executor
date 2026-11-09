@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import glob
+import math
 import os
+import re
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -49,6 +51,14 @@ def _num(value: Any, digits: int = 2) -> Any:
         return value
 
 
+def _clamp(value: Any, lo: float, hi: float) -> float:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return lo
+    return max(lo, min(hi, n))
+
+
 def _timeframe(name: str):
     if mt5 is None:
         return None
@@ -75,11 +85,60 @@ def _side(order_type: int) -> str:
     return "buy" if order_type in buy_types else "sell"
 
 
+_SYMBOL_SUFFIXES = [
+    "m", ".m", ".raw", "m.raw", ".m.raw", "z", ".z", ".a", ".pro", ".ecn", ".std",
+    ".c", ".r", ".cash", ".mini", ".micro", ".plus", ".prime", ".zero", ".d", ".s",
+    ".t", ".fx", ".spot", ".index", ".cfd", "-5", "#", "_i", ".i", ".sv", "_raw", "-raw",
+]
+_SYMBOL_PREFIXES = ["#", "x", "cfd", "fx", "mt5"]
+_SYMBOL_ALIASES = {
+    "XAUUSD": ["XAUUSD", "GOLD", "GOLDSPOT", "XAU/USD"],
+    "XAGUSD": ["XAGUSD", "SILVER", "XAG/USD"],
+    "BTCUSD": ["BTCUSD", "BTCUSDT", "BITCOIN", "BTC"],
+    "ETHUSD": ["ETHUSD", "ETHUSDT", "ETHEREUM"],
+    "US30": ["US30", "DJ30", "DOW30", "DOWJONES", "USA30", "WS30"],
+    "NAS100": ["NAS100", "USTEC", "US100", "TECH100", "NDX100"],
+    "SPX500": ["SPX500", "US500", "SP500", "SPX"],
+    "GER40": ["GER40", "DE40", "DAX40", "GER30", "DE30"],
+    "UK100": ["UK100", "FTSE100", "FTSE"],
+    "JP225": ["JP225", "JPN225", "NIKKEI225", "NIKKEI"],
+    "WTI": ["WTI", "USOIL", "CRUDEOIL", "CL"],
+    "USOIL": ["USOIL", "WTI", "CRUDEOIL"],
+}
+
+
+def _norm_symbol(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _symbol_score(requested: str, broker: str, aliases: List[str]) -> int:
+    req = _norm_symbol(requested)
+    got = _norm_symbol(broker)
+    if not req or not got:
+        return 0
+    for alias in aliases:
+        a = _norm_symbol(alias)
+        if not a:
+            continue
+        if got == a:
+            return 100
+        if got.startswith(a) and len(got) - len(a) <= 8:
+            return 86
+        if got.endswith(a) and len(got) - len(a) <= 6:
+            return 82
+        if a in got and len(got) <= len(a) + 8:
+            return 60
+    return 0
+
+
 class TerminalPool:
     def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run or os.environ.get("MT5_DRY_RUN") == "1"
         self.current: Optional[Dict[str, Any]] = None
         self.connected_at: Optional[float] = None
+        self._symbol_cache: Dict[str, Any] = {}
+        self._symbol_rows_cache = None
+        self._symbol_rows_at = 0.0
 
     # ---------------------------------------------------------------- session
     def connect(self, credentials: Dict[str, Any]) -> Dict[str, Any]:
@@ -99,6 +158,9 @@ class TerminalPool:
         key = (str(credentials.get("login")), str(credentials.get("server")))
         if self.current and (str(self.current.get("login")), str(self.current.get("server"))) == key:
             return self.status(credentials)
+        self._symbol_cache.clear()
+        self._symbol_rows_cache = None
+        self._symbol_rows_at = 0.0
         try:
             mt5.shutdown()
         except Exception:
@@ -356,6 +418,195 @@ class TerminalPool:
             )
         out.reverse()
         return {"deals": out, "count": len(out), "mode": "live"}
+
+    def ticks(self, credentials: Dict[str, Any], symbol: str, count: int = 400) -> Dict[str, Any]:
+        self._ensure(credentials)
+        if self.dry_run or mt5 is None:
+            return {"available": False, "ticks": 0}
+        broker = self._resolve(symbol)
+        mt5.symbol_select(broker, True)
+        flags = getattr(mt5, "COPY_TICKS_ALL", 0)
+        rows = mt5.copy_ticks_from_pos(broker, 0, int(count), flags)
+        if rows is None or len(rows) == 0:
+            return {"available": False, "ticks": 0, "brokerSymbol": broker}
+        buy_flag = int(getattr(mt5, "TICK_FLAG_BUY", 32))
+        sell_flag = int(getattr(mt5, "TICK_FLAG_SELL", 64))
+        buy_vol = sell_vol = 0.0
+        up = down = flat = 0
+        last_mid = None
+        for row in rows:
+            if hasattr(row, "_asdict"):
+                d = row._asdict()
+            elif getattr(row, "dtype", None) is not None and getattr(row.dtype, "names", None):
+                d = {key: row[key] for key in row.dtype.names}
+            else:
+                d = dict(row)
+            volume = float(d.get("volume_real") or d.get("volume") or 0.0) or 1.0
+            flag = int(d.get("flags") or 0)
+            bid = float(d.get("bid") or 0.0)
+            ask = float(d.get("ask") or 0.0)
+            mid = (bid + ask) / 2.0 if bid and ask else float(d.get("last") or 0.0)
+            if flag & buy_flag:
+                buy_vol += volume
+            elif flag & sell_flag:
+                sell_vol += volume
+            elif last_mid is not None and mid:
+                if mid > last_mid:
+                    buy_vol += volume
+                    up += 1
+                elif mid < last_mid:
+                    sell_vol += volume
+                    down += 1
+                else:
+                    flat += 1
+            if mid:
+                last_mid = mid
+        total = buy_vol + sell_vol
+        delta = buy_vol - sell_vol
+        return {
+            "available": total > 0,
+            "brokerSymbol": broker,
+            "ticks": int(len(rows)),
+            "buyVolume": round(buy_vol, 2),
+            "sellVolume": round(sell_vol, 2),
+            "tickDelta": round(delta, 2),
+            "tickDeltaRatio": round(delta / total, 4) if total else 0.0,
+            "upTicks": up,
+            "downTicks": down,
+            "flatTicks": flat,
+        }
+
+    def depth(self, credentials: Dict[str, Any], symbol: str, levels: int = 8) -> Dict[str, Any]:
+        self._ensure(credentials)
+        if self.dry_run or mt5 is None:
+            return {"available": False, "bids": [], "asks": []}
+        broker = self._resolve(symbol)
+        mt5.symbol_select(broker, True)
+        added = False
+        try:
+            added = bool(mt5.market_book_add(broker))
+            raw = mt5.market_book_get(broker) or []
+        except Exception:
+            raw = []
+        finally:
+            if added:
+                try:
+                    mt5.market_book_release(broker)
+                except Exception:
+                    pass
+        buy_type = int(getattr(mt5, "BOOK_TYPE_BUY", 0))
+        sell_type = int(getattr(mt5, "BOOK_TYPE_SELL", 1))
+        bids: List[Dict[str, float]] = []
+        asks: List[Dict[str, float]] = []
+        for row in raw:
+            if hasattr(row, "_asdict"):
+                d = row._asdict()
+            elif getattr(row, "dtype", None) is not None and getattr(row.dtype, "names", None):
+                d = {key: row[key] for key in row.dtype.names}
+            else:
+                d = dict(row)
+            price = float(d.get("price") or 0.0)
+            volume = float(d.get("volume") or 0.0)
+            kind = int(d.get("type") or 0)
+            if price <= 0 or volume <= 0:
+                continue
+            if kind == sell_type:
+                asks.append({"price": price, "volume": volume})
+            elif kind == buy_type:
+                bids.append({"price": price, "volume": volume})
+        bids.sort(key=lambda x: x["price"], reverse=True)
+        asks.sort(key=lambda x: x["price"])
+        bids = bids[:levels]
+        asks = asks[:levels]
+        bid_depth = sum(x["volume"] for x in bids)
+        ask_depth = sum(x["volume"] for x in asks)
+        total = bid_depth + ask_depth
+        return {
+            "available": bool(bids or asks),
+            "brokerSymbol": broker,
+            "bids": bids,
+            "asks": asks,
+            "bidDepth": round(bid_depth, 2),
+            "askDepth": round(ask_depth, 2),
+            "depthImbalance": round((bid_depth - ask_depth) / total, 4) if total else 0.0,
+            "bestBid": bids[0]["price"] if bids else None,
+            "bestAsk": asks[0]["price"] if asks else None,
+        }
+
+    def orderflow(self, credentials: Dict[str, Any], symbol: str, quote: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        self._ensure(credentials)
+        if self.dry_run or mt5 is None or os.environ.get("MT5_ORDERFLOW", "1") == "0":
+            return {"available": False, "notes": ["Orderflow disabled"]}
+        notes: List[str] = []
+        tick_data: Dict[str, Any] = {}
+        depth_data: Dict[str, Any] = {}
+        try:
+            tick_data = self.ticks(credentials, symbol, 500)
+        except Exception as e:
+            notes.append("ticks: %s" % str(e)[:80])
+        try:
+            depth_data = self.depth(credentials, symbol, 8)
+        except Exception as e:
+            notes.append("depth: %s" % str(e)[:80])
+        broker = tick_data.get("brokerSymbol") or depth_data.get("brokerSymbol") or symbol
+        bars: List[Dict[str, Any]] = []
+        try:
+            bars = self.rates(credentials, symbol, "M5", 120)
+        except Exception:
+            bars = []
+        bar_delta = 0.0
+        bar_volume = 0.0
+        absorption = 0.0
+        if bars:
+            recent = bars[-40:]
+            vols = [float(b.get("tickVolume") or 0) for b in recent]
+            mean_vol = sum(vols) / len(vols) if vols else 0.0
+            var = sum((v - mean_vol) ** 2 for v in vols) / len(vols) if vols else 0.0
+            sd = math.sqrt(var) if var > 0 else 0.0
+            for b in recent[-24:]:
+                high = float(b.get("high") or 0)
+                low = float(b.get("low") or 0)
+                close = float(b.get("close") or 0)
+                volume = float(b.get("tickVolume") or 0)
+                rng = high - low
+                pos = ((close - low) / rng) if rng > 0 else 0.5
+                delta = volume * (2.0 * pos - 1.0)
+                bar_delta += delta
+                bar_volume += volume
+                if mean_vol > 0 and volume > mean_vol + 1.5 * sd and rng > 0:
+                    absorption += (-delta) * 0.15
+        bar_delta_ratio = (bar_delta / bar_volume) if bar_volume else 0.0
+        depth_imbalance = float(depth_data.get("depthImbalance") or 0.0)
+        tick_ratio = float(tick_data.get("tickDeltaRatio") or 0.0)
+        score = _clamp(0.45 * depth_imbalance + 0.35 * tick_ratio + 0.20 * bar_delta_ratio + absorption, -1.0, 1.0)
+        pressure = "buyers" if score > 0.15 else "sellers" if score < -0.15 else "balanced"
+        bid = float((quote or {}).get("bid") or depth_data.get("bestBid") or 0.0)
+        ask = float((quote or {}).get("ask") or depth_data.get("bestAsk") or 0.0)
+        if depth_data.get("available"):
+            notes.append("DOM %s: bid %.2f vs ask %.2f" % (pressure, depth_data.get("bidDepth") or 0, depth_data.get("askDepth") or 0))
+        if tick_data.get("available"):
+            notes.append("Ticks %s: delta %+.2f (%+.1f%%)" % (pressure, tick_data.get("tickDelta") or 0, tick_ratio * 100))
+        if bar_delta_ratio:
+            notes.append("M5 volume delta %+.1f%%" % (bar_delta_ratio * 100))
+        return {
+            "available": bool(tick_data.get("available") or depth_data.get("available") or bars),
+            "symbol": symbol,
+            "brokerSymbol": broker,
+            "score": round(score, 4),
+            "pressure": pressure,
+            "depthImbalance": round(depth_imbalance, 4),
+            "tickDeltaRatio": round(tick_ratio, 4),
+            "barDeltaRatio": round(bar_delta_ratio, 4),
+            "tickDelta": tick_data.get("tickDelta"),
+            "buyVolume": tick_data.get("buyVolume"),
+            "sellVolume": tick_data.get("sellVolume"),
+            "bidDepth": depth_data.get("bidDepth"),
+            "askDepth": depth_data.get("askDepth"),
+            "bids": depth_data.get("bids") or [],
+            "asks": depth_data.get("asks") or [],
+            "spread": round(ask - bid, 6) if bid and ask else None,
+            "notes": notes[:6],
+        }
 
     def symbols(self, credentials: Dict[str, Any], query: Dict[str, Any]) -> Dict[str, Any]:
         self._ensure(credentials)
@@ -756,21 +1007,43 @@ class TerminalPool:
         name = str(symbol or "").strip().upper()
         if not name or mt5 is None:
             return name
-        info = mt5.symbol_info(name)
-        if info is not None:
-            return info.name
-        for suffix in ("m", ".m", ".raw", "m.raw", "z", ".z"):
-            cand = name + suffix
-            info = mt5.symbol_info(cand)
+        cached = self._symbol_cache.get(name)
+        if cached and time.time() - cached[1] < 60:
+            return cached[0]
+        aliases = _SYMBOL_ALIASES.get(_norm_symbol(name), [name])
+        variants = [name] + [name + s for s in _SYMBOL_SUFFIXES] + [p + name for p in _SYMBOL_PREFIXES]
+        for variant in variants:
+            try:
+                info = mt5.symbol_info(variant)
+            except Exception:
+                info = None
             if info is not None:
+                self._symbol_cache[name] = (info.name, time.time())
                 return info.name
+        rows = self._symbol_rows()
+        best = None
+        best_score = 0
+        for row in rows:
+            broker = str(getattr(row, "name", "") or "")
+            score = _symbol_score(name, broker, aliases)
+            if score > best_score or (score == best_score and best and len(broker) < len(best)):
+                best = broker
+                best_score = score
+        resolved = best if best_score >= 50 else name
+        self._symbol_cache[name] = (resolved, time.time())
+        return resolved
+
+    def _symbol_rows(self):
+        now = time.time()
+        if self._symbol_rows_cache is not None and now - self._symbol_rows_at < 60:
+            return self._symbol_rows_cache
         try:
-            for row in mt5.symbols_get() or []:
-                if str(row.name).upper() == name:
-                    return row.name
+            rows = mt5.symbols_get() or []
         except Exception:
-            pass
-        return name
+            rows = []
+        self._symbol_rows_cache = rows
+        self._symbol_rows_at = now
+        return rows
 
     def _tick(self, symbol: str):
         mt5.symbol_select(symbol, True)

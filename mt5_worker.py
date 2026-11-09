@@ -18,6 +18,7 @@ import requests
 
 from mt5_pool import Mt5Error, TerminalPool, WATCHLIST
 from ai_engine import AIAgent
+from komz_brain import KomzBrain
 
 API = (os.environ.get("MT5_API_URL") or "").rstrip("/")
 SECRET = os.environ.get("MT5_WORKER_SECRET") or ""
@@ -135,6 +136,7 @@ def ai_loop(pool: TerminalPool) -> None:
         log("ai engine skipped on shard %s (owner shard %s)" % (SHARD, AI_SHARD))
         return
     pool_ref[0] = pool
+    brain = KomzBrain(log)
     agent = AIAgent(
         pool,
         lambda path, body: api(path, body=body, timeout=90),
@@ -142,7 +144,9 @@ def ai_loop(pool: TerminalPool) -> None:
         lock=POOL_LOCK,
         interval=AI_INTERVAL,
         on_account=ai_account_seen,
+        brain=brain,
     )
+    log("komz brain online=%s model=%s" % (brain.available(), brain.model))
     log("ai engine online interval=%ss magic=20261109" % AI_INTERVAL)
     agent.run_forever(STOP)
 
