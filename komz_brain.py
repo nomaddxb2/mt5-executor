@@ -561,10 +561,12 @@ class KomzCouncil:
             ) for m in ok_members
         )
         aggressive = str(cfg.get("mode") or "balanced").lower() == "aggressive"
+        min_conf = float(state.get("params", {}).get("minConfidence") or 0.15)
         judge_system = (
             "You are the Portfolio Chair of Komz's agent family. Decide whether the deterministic candidate is worth trading now. "
             "Protect capital, but do not demand perfection: LO wants more good trades, recoveries and discoveries. "
             "Approve when there is a coherent edge and no hard risk violation. Reject on genuine danger. "
+            "The active confidence threshold is %.2f; do not reject solely because confidence is below 0.55 or because the family is split. " % min_conf
             + ("Aggressive mode is active: prefer a coherent trade over waiting for unanimity. Approve a strong deterministic edge with size_multiplier 0.5-0.75 even if the family is split; reject only on hard risk, event danger, or a strong Risk Guardian veto. " if aggressive else "")
             + "Return ONLY one strict JSON object."
         )
@@ -796,6 +798,8 @@ class KomzBrain:
             "recovery": state.get("komz", {}).get("recovery"),
             "rules": {
                 "minLotRiskCapPct": 2.0,
+                "profile": state.get("profile") or "balanced",
+                "minConfidence": state.get("params", {}).get("minConfidence"),
                 "maxPositions": state.get("params", {}).get("maxPositions"),
                 "riskPct": state.get("params", {}).get("riskPct"),
                 "dailyLossPct": state.get("params", {}).get("maxDailyLossPct"),
@@ -807,6 +811,7 @@ class KomzBrain:
             "You are Komz, LO's autonomous MT5 trading second brain. "
             "You are disciplined, adaptive and research-driven: protect capital first, compound second, recover without revenge trading. "
             "The deterministic engine gives you a candidate. You may only approve or reject that candidate; never invent a trade, never change volume, never exceed the 2% min-lot risk cap. "
+            "Use the active confidence threshold in context.rules.minConfidence; never import a fixed 0.55 threshold. "
             "If the setup is unclear, reject. Learn from every outcome and keep a compact, reusable playbook. "
             "Return ONLY one strict JSON object with the requested keys. No markdown, no prose outside JSON."
         )
