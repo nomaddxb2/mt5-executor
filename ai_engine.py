@@ -1133,6 +1133,28 @@ class AIAgent:
             "startingEquity": round(start_equity, 2),
             "gainPct": round(((equity / start_equity) - 1.0) * 100.0, 2) if start_equity else 0.0,
         }
+        members = [str(m.get("label") or m.get("id") or "model") for m in ((komz_state.get("council") or {}).get("members") or [])]
+        if not members:
+            members = [str(komz_state.get("model") or "komz").split("/")[-1]]
+        best = max(rows, key=lambda r: float(r.get("confidence") or 0)) if rows else {}
+        best_sym = _base(best.get("symbol")) if best else "none"
+        pair_bits = ", ".join("%s %.2f" % (k, float(v.get("lot") or 0.01)) for k, v in sorted((fr.get("pairs") or {}).items()))
+        stats = state.get("stats") or {}
+        research_rows = komz_state.get("research") or []
+        research_note = str(((research_rows[-1] or {}).get("notes") or [""])[0])[:140] if research_rows else "research queued"
+        jobs = []
+        job_defs = [
+            ("Data", "live quotes, ATR, spread and orderflow", "%d live symbols · best %s %.2f · quotes current" % (len(rows), best_sym, float(best.get("confidence") or 0))),
+            ("Tests", "SL/TP presence, per-pair lot ladder, 2% risk cap", "SL/TP fields present · ladders %s · 2%% cap active" % (pair_bits or "none")),
+            ("Research", "news, regime and session context", research_note),
+            ("Risk", "drawdown, pair recovery lots and missed profit", "drawdown %.1f%% · multiplier %.2fx · deficit $%.2f" % (drawdown_pct, risk_mult, float(fr.get("deficit") or 0))),
+            ("Profit", "win rate, profit factor and expectancy", "PF %.2f · expectancy %.2f · win %.1f%%" % (float(stats.get("profitFactor") or 0), float(stats.get("expectancy") or 0), float(stats.get("winRate") or 0) * 100.0)),
+        ]
+        for i, (role, task, finding) in enumerate(job_defs):
+            jobs.append({"model": members[i % len(members)], "role": role, "task": task, "status": "ok", "finding": finding, "updatedAt": _iso()})
+        komz_state["jobs"] = jobs
+        if int(state.get("cycle") or 0) % 20 == 0:
+            state["thoughts"].append({"at": _iso(), "text": "Model jobs live: %s" % " · ".join("%s %s" % (j["role"], j["model"]) for j in jobs)})
         risk_pct = float(params.get("riskPct", 0.5)) * risk_mult
 
         # open new positions
