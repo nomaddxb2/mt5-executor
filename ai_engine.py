@@ -74,6 +74,26 @@ def _base(symbol: str) -> str:
     return s
 
 
+def flip_lot(step: int, base: float = 0.01) -> float:
+    return round(float(base) * (2 ** max(0, int(step))), 2)
+
+
+def ensure_flip_sequence(fr: Dict[str, Any], up_to: int) -> List[float]:
+    seq = [float(x) for x in (fr.get("sequence") or [])]
+    base = float(fr.get("baseLot") or 0.01)
+    if not seq:
+        seq = [flip_lot(0, base)]
+    while len(seq) <= int(up_to):
+        seq.append(flip_lot(len(seq), base))
+    fr["sequence"] = seq
+    return seq
+
+
+def flip_required_lot(target_usd: float, width: float, tick_value: float, tick_size: float) -> float:
+    vpp = (float(tick_value) / float(tick_size)) if tick_size else 0.0
+    return (float(target_usd) / (float(width) * vpp)) if width > 0 and vpp > 0 else 0.0
+
+
 def update_flip_pair(fr: Dict[str, Any], seq: List[float], symbol: str, pnl: float, side: str = "") -> None:
     base = _base(symbol)
     key = "%s:%s" % (base, str(side or "").upper()) if side else base
@@ -81,12 +101,16 @@ def update_flip_pair(fr: Dict[str, Any], seq: List[float], symbol: str, pnl: flo
     pair = pairs.setdefault(key, {"step": 0, "lot": seq[0], "deficit": 0.0, "missedProfit": float(fr.get("missedProfit") or 0.0)})
     if pnl < 0:
         pair["deficit"] = round(max(0.0, float(pair.get("deficit") or 0) + abs(pnl) + float(pair.get("missedProfit") or fr.get("missedProfit") or 0.0)), 2)
-        pair["step"] = min(int(pair.get("step") or 0) + 1, len(seq) - 1)
+        pair["step"] = max(0, int(pair.get("step") or 0) + 1)
     elif pnl > 0:
         pair["step"] = 0
         pair["deficit"] = 0.0
-    pair["lot"] = float(seq[int(pair.get("step") or 0)])
+    step = max(0, int(pair.get("step") or 0))
+    while len(seq) <= step:
+        seq.append(flip_lot(len(seq), float(fr.get("baseLot") or 0.01)))
+    pair["lot"] = float(seq[step])
     pairs[key] = pair
+    fr["sequence"] = seq
     fr["lot"] = max(float(p.get("lot") or seq[0]) for p in pairs.values())
     fr["step"] = max(int(p.get("step") or 0) for p in pairs.values())
     fr["deficit"] = round(sum(float(p.get("deficit") or 0) for p in pairs.values()), 2)
@@ -615,9 +639,9 @@ def initial_state() -> Dict[str, Any]:
         "startingEquity": None,
         "peakEquity": None,
         "flipRecovery": {
-            "baseLot": 0.01, "maxLot": 0.08, "step": 0, "lot": 0.01,
+            "baseLot": 0.01, "maxLot": None, "step": 0, "lot": 0.01,
             "deficit": 0.0, "missedProfit": 0.0,
-            "sequence": [0.01, 0.02, 0.04, 0.08],
+            "sequence": [0.01, 0.02, 0.04, 0.08, 0.16, 0.32],
             "pairs": {},
         },
         "komz": {
@@ -848,16 +872,13 @@ class AIAgent:
         if state.get("startingEquity") is None:
             state["startingEquity"] = equity
         fr = state.setdefault("flipRecovery", {
-            "baseLot": 0.01, "maxLot": 0.08, "step": 0, "lot": 0.01,
+            "baseLot": 0.01, "maxLot": None, "step": 0, "lot": 0.01,
             "deficit": 0.0, "missedProfit": 0.0,
-            "sequence": [0.01, 0.02, 0.04, 0.08], "pairs": {},
+            "sequence": [0.01, 0.02, 0.04, 0.08, 0.16, 0.32], "pairs": {},
         })
-        seq = [float(x) for x in (fr.get("sequence") or [0.01, 0.02, 0.04, 0.08])]
-        if not seq:
-            seq = [0.01, 0.02, 0.04, 0.08]
-        fr["sequence"] = seq
-        fr["baseLot"] = float(fr.get("baseLot") or seq[0])
-        fr["maxLot"] = float(fr.get("maxLot") or seq[-1])
+        fr["baseLot"] = float(fr.get("baseLot") or 0.01)
+        seq = ensure_flip_sequence(fr, 6)
+        fr["maxLot"] = None
         if not isinstance(fr.get("pairs"), dict):
             fr["pairs"] = {}
             fr["legacyDeficit"] = round(float(fr.get("deficit") or 0), 2)
@@ -871,7 +892,8 @@ class AIAgent:
         for key, pair in list(fr["pairs"].items()):
             if not isinstance(pair, dict):
                 pair = {}
-            pair["step"] = max(0, min(int(pair.get("step") or 0), len(seq) - 1))
+            pair["step"] = max(0, int(pair.get("step") or 0))
+            seq = ensure_flip_sequence(fr, pair["step"])
             pair["lot"] = float(seq[pair["step"]])
             pair["deficit"] = round(max(0.0, float(pair.get("deficit") or 0)), 2)
             pair["missedProfit"] = missed
@@ -1165,7 +1187,7 @@ class AIAgent:
         jobs = []
         job_defs = [
             ("Data", "live quotes, ATR, spread and orderflow", "%d live symbols · best %s %.2f · quotes current" % (len(rows), best_sym, float(best.get("confidence") or 0))),
-            ("Tests", "SL/TP presence, per-pair lot ladder, 2% risk cap", "SL/TP fields present · ladders %s · 2%% cap active" % (pair_bits or "none")),
+            ("Tests", "SL/TP presence, unbounded per-pair ladder, 5% flip cap", "SL/TP fields present · ladders %s · 5%% flip cap active" % (pair_bits or "none")),
             ("Research", "news, regime and session context", research_note),
             ("Risk", "drawdown, pair recovery lots and missed profit", "drawdown %.1f%% · multiplier %.2fx · deficit $%.2f" % (drawdown_pct, risk_mult, float(fr.get("deficit") or 0))),
             ("Hedge", "two-sided BTC/Gold grid, side ladders, opposite TP/SL alignment", "active %s · side ladders %s" % (hedge_bits, pair_bits or "none")),
@@ -1202,14 +1224,12 @@ class AIAgent:
                         break
                     pair_key = "%s:%s" % (base, side.upper())
                     pair = (fr.get("pairs") or {}).get(pair_key) or {"step": 0, "lot": seq[0], "deficit": 0.0, "missedProfit": float(fr.get("missedProfit") or 0.0)}
-                    step = max(0, min(int(pair.get("step") or 0), len(seq) - 1))
-                    lots = float(seq[step])
+                    step = max(0, int(pair.get("step") or 0))
+                    seq = ensure_flip_sequence(fr, step)
+                    ladder_lot = float(seq[step])
                     vmin = float(spec.get("volumeMin") or 0.01)
                     vstep = float(spec.get("volumeStep") or 0.01)
-                    if vstep > 0:
-                        lots = round(lots / vstep) * vstep
-                    lots = max(vmin, lots)
-                    lots = min(lots, float(spec.get("volumeMax") or lots))
+                    vmax = float(spec.get("volumeMax") or ladder_lot)
                     price = float(row.get("ask") if side == "buy" else row.get("bid") or row.get("price") or 0)
                     if price <= 0:
                         continue
@@ -1218,6 +1238,12 @@ class AIAgent:
                     target_usd = max(missed, deficit + missed)
                     tick_value = float(spec.get("tickValue") or 1.0)
                     tick_size = float(spec.get("tickSize") or 0.00001)
+                    required_lot = flip_required_lot(target_usd, max(0.7 * atr_v, 1e-9), tick_value, tick_size) if deficit > 0 else 0.0
+                    lots = max(ladder_lot, required_lot)
+                    if vstep > 0:
+                        lots = math.ceil((lots - 1e-9) / vstep) * vstep
+                    lots = max(vmin, lots)
+                    lots = min(lots, vmax)
                     usd_per_price = (tick_value / tick_size) * lots if tick_size else 0.0
                     target_dist = (target_usd / usd_per_price) if usd_per_price > 0 else 0.7 * atr_v
                     width = max(0.7 * atr_v, min(target_dist, 4.0 * atr_v))
@@ -1235,12 +1261,12 @@ class AIAgent:
                         sl = opp_tp - buffer if side == "sell" else opp_tp + buffer
                     risk_per_lot = abs(price - sl) * (tick_value / tick_size) if tick_size else abs(price - sl) * 100000.0
                     actual_risk = risk_per_lot * lots
-                    if actual_risk > equity * 0.02:
+                    if actual_risk > equity * 0.05:
                         state["decisions"].append({
                             "id": "h%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
                             "symbol": base, "side": side, "confidence": float(row.get("confidence") or 0),
                             "price": price, "volume": lots,
-                            "reason": "Hedge skipped: %.2f lot risk $%.2f is above the 2.0%% cap." % (lots, actual_risk),
+                            "reason": "Hedge skipped: %.2f lot risk $%.2f is above the 5.0%% flip cap." % (lots, actual_risk),
                         })
                         continue
                     try:
@@ -1263,6 +1289,9 @@ class AIAgent:
                         continue
                     pairs = fr.setdefault("pairs", {})
                     pair["lot"] = lots
+                    pair["ladderLot"] = round(ladder_lot, 4)
+                    pair["requiredLot"] = round(required_lot, 4)
+                    pair["lotAdded"] = round(max(0.0, lots - ladder_lot), 4)
                     pair["missedProfit"] = missed
                     pairs[pair_key] = pair
                     state["positions"].append({
@@ -1277,7 +1306,7 @@ class AIAgent:
                         "id": "ho%d" % int(time.time() * 1000), "at": _iso(), "action": side,
                         "symbol": base, "side": side, "confidence": float(row.get("confidence") or 0),
                         "price": fill, "volume": lots,
-                        "reason": "Flip hedge: %s %.2f lots; SL %.5f near opposite TP; virtual TP %.5f; ladder step %d." % (side.upper(), lots, sl, target_tp, step),
+                        "reason": "Flip hedge: %s %.2f lots (ladder %.2f, added %.2f for $%.2f demand); SL %.5f near opposite TP; virtual TP %.5f; ladder step %d." % (side.upper(), lots, ladder_lot, max(0.0, lots - ladder_lot), target_usd, sl, target_tp, step),
                     })
                     opposite = next((p for p in state["positions"] if _base(p.get("symbol")) == base and str(p.get("side") or "").lower() != side and not p.get("tpArmed")), None)
                     if opposite:
@@ -1340,15 +1369,12 @@ class AIAgent:
                 pair_key = "%s:%s" % (base_sym, side_key)
                 pairs = fr.setdefault("pairs", {})
                 pair = pairs.setdefault(pair_key, {"step": 0, "lot": seq[0], "deficit": 0.0, "missedProfit": float(fr.get("missedProfit") or 0.0)})
-                step = max(0, min(int(pair.get("step") or 0), len(seq) - 1))
-                lots = float(seq[step])
+                step = max(0, int(pair.get("step") or 0))
+                seq = ensure_flip_sequence(fr, step)
+                ladder_lot = float(seq[step])
                 vmin = float(spec.get("volumeMin") or 0.01)
                 vstep = float(spec.get("volumeStep") or 0.01)
-                if vstep > 0:
-                    lots = round(lots / vstep) * vstep
-                lots = max(vmin, lots)
-                vmax = float(spec.get("volumeMax") or lots)
-                lots = min(lots, vmax)
+                vmax = float(spec.get("volumeMax") or ladder_lot)
                 atr_v = float(cand.get("atr") or 0)
                 base_tp_dist = max(0.7 * atr_v, abs(price - float(cand.get("tp") or price)))
                 deficit = float(pair.get("deficit") or 0)
@@ -1356,12 +1382,21 @@ class AIAgent:
                 target_usd = max(missed, deficit + missed)
                 tick_value = float(spec.get("tickValue") or 1.0)
                 tick_size = float(spec.get("tickSize") or 0.00001)
+                required_lot = flip_required_lot(target_usd, base_tp_dist, tick_value, tick_size) if deficit > 0 else 0.0
+                lots = max(ladder_lot, required_lot)
+                if vstep > 0:
+                    lots = math.ceil((lots - 1e-9) / vstep) * vstep
+                lots = max(vmin, lots)
+                lots = min(lots, vmax)
                 usd_per_price = (tick_value / tick_size) * lots if tick_size else 0.0
                 target_dist = (target_usd / usd_per_price) if usd_per_price > 0 else base_tp_dist
                 max_tp = max(base_tp_dist, atr_v * 4.0)
                 tp_dist = max(base_tp_dist, min(target_dist, max_tp))
                 cand["tp"] = price + tp_dist if cand.get("side") == "buy" else price - tp_dist
                 pair["lot"] = lots
+                pair["ladderLot"] = round(ladder_lot, 4)
+                pair["requiredLot"] = round(required_lot, 4)
+                pair["lotAdded"] = round(max(0.0, lots - ladder_lot), 4)
                 pair["missedProfit"] = missed
                 pairs[pair_key] = pair
             if lots <= 0:
@@ -1370,7 +1405,7 @@ class AIAgent:
             tick_size = float(spec.get("tickSize") or 0.00001)
             risk_per_lot = sl_dist * (tick_value / tick_size) if tick_size else sl_dist * 100000.0
             actual_risk = risk_per_lot * lots
-            risk_cap = max(0.0, equity * 0.02)
+            risk_cap = max(0.0, equity * (0.05 if flip else 0.02))
             if actual_risk > risk_cap:
                 last_risk = float((state.get("lastRiskHoldAt") or {}).get(sym) or 0)
                 if now - last_risk > 300:
@@ -1378,8 +1413,8 @@ class AIAgent:
                         "id": "r%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
                         "symbol": sym, "side": None, "confidence": cand.get("confidence"),
                         "price": price, "volume": lots,
-                        "reason": "Min-lot risk $%.2f is %.1f%% of equity, above the 2.0%% hard cap. Skipping %s." % (
-                            actual_risk, (actual_risk / equity * 100.0) if equity else 0, sym),
+                        "reason": "Min-lot risk $%.2f is %.1f%% of equity, above the %.1f%% cap. Skipping %s." % (
+                            actual_risk, (actual_risk / equity * 100.0) if equity else 0, 5.0 if flip else 2.0, sym),
                     })
                     state.setdefault("lastRiskHoldAt", {})[sym] = now
                 continue
