@@ -843,6 +843,8 @@ class KomzBrain:
         side = str(candidate.get("side") or "")
         if not sym or side not in ("buy", "sell"):
             return None
+        if cfg.get("flipMode"):
+            return None
         if self.council.enabled and not cfg.get("flipMode"):
             result = self.council.review(account_id, cfg, state, candidate, market, info, progress=progress)
             if result:

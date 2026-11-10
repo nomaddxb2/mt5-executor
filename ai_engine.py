@@ -1057,7 +1057,7 @@ class AIAgent:
                     state.setdefault("lastRiskHoldAt", {})[sym] = now
                 continue
             review = None
-            if use_brain and reviews_done < 2:
+            if use_brain and reviews_done < 2 and not flip:
                 reviews_done += 1
                 try:
                     review = self.brain.review_entry(account_id, cfg, state, cand, market, info, progress=progress)
