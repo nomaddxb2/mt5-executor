@@ -1117,6 +1117,9 @@ class AIAgent:
                             })
                         except Exception as e:
                             state["error"] = "trail failed: %s" % e
+            if flip and _base(pos.get("symbol")) in ("BTCUSD", "XAUUSD"):
+                entry["hedge"] = True
+                entry["pairKey"] = entry.get("pairKey") or "%s:%s" % (_base(pos.get("symbol")), str(side or "").upper())
             kept.append(entry)
 
         state["positions"] = kept
@@ -1294,6 +1297,8 @@ class AIAgent:
                     pair["lotAdded"] = round(max(0.0, lots - ladder_lot), 4)
                     pair["missedProfit"] = missed
                     pairs[pair_key] = pair
+                    open_count += 1
+                    open_sides.add((base, side))
                     state["positions"].append({
                         "ticket": ticket, "symbol": row.get("symbol"), "side": side, "volume": lots,
                         "openPrice": fill, "currentPrice": fill, "profit": 0,
