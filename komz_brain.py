@@ -191,6 +191,21 @@ class KomzMemory:
         return sent > 0
 
     def _supabase(self, account_id: str, kind: str, text: str) -> bool:
+        api_url = (os.environ.get("MT5_API_URL") or "").rstrip("/")
+        worker_secret = os.environ.get("MT5_WORKER_SECRET") or ""
+        if api_url and worker_secret:
+            try:
+                res = requests.post(
+                    api_url + "/v1/worker/komz/memory",
+                    headers={"x-worker-secret": worker_secret},
+                    json={"accountId": account_id, "kind": kind, "text": text},
+                    timeout=30,
+                )
+                if res.status_code < 400:
+                    return True
+                self.log("komz mirror api failed: %s" % _redact(res.text[:200]))
+            except Exception as e:
+                self.log("komz mirror api error: %s" % _redact(e))
         if not (self.supabase_url and self.supabase_key):
             return False
         safe_account = re.sub(r"[^A-Za-z0-9_-]", "_", account_id or "account")
