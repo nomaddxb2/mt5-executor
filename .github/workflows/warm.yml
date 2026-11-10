@@ -7,15 +7,45 @@ on:
   schedule:
     - cron: '0 */6 * * *'
 
-concurrency:
-  group: mt5-warm
-  cancel-in-progress: false
-
 permissions:
   contents: read
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - id: plan
+        shell: bash
+        env:
+          MT5_API_URL: ${{ secrets.MT5_API_URL }}
+          MT5_WORKER_SECRET: ${{ secrets.MT5_WORKER_SECRET }}
+          MT5_MAX_WORKERS: ${{ vars.MT5_MAX_WORKERS || '4' }}
+        run: |
+          set -euo pipefail
+          count=$(curl -fsS -X POST "$MT5_API_URL/v1/worker/ai/accounts"             -H "X-Worker-Secret: $MT5_WORKER_SECRET"             -H 'Content-Type: application/json'             -d '{"shard":0,"shards":1}' | jq -r '.count // 0' || echo 0)
+          if ! [[ "$count" =~ ^[0-9]+$ ]]; then count=0; fi
+          max=${MT5_MAX_WORKERS:-4}
+          if ! [[ "$max" =~ ^[0-9]+$ ]]; then max=4; fi
+          if [ "$count" -lt 1 ]; then count=1; fi
+          if [ "$count" -gt "$max" ]; then count=$max; fi
+          shards=$(python3 -c "import json,sys; print(json.dumps(list(range(int(sys.argv[1])))))" "$count")
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "workers=$count"
+
   warm:
+    needs: plan
+    concurrency:
+      group: mt5-warm-${{ matrix.shard }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     runs-on: windows-latest
     timeout-minutes: 350
     steps:
@@ -78,9 +108,9 @@ jobs:
         env:
           MT5_API_URL: ${{ secrets.MT5_API_URL }}
           MT5_WORKER_SECRET: ${{ secrets.MT5_WORKER_SECRET }}
-          MT5_WORKER_ID: github-${{ github.run_id }}
-          MT5_SHARD: ${{ vars.MT5_SHARD || '0' }}
-          MT5_SHARDS: ${{ vars.MT5_SHARDS || '1' }}
+          MT5_WORKER_ID: github-${{ github.run_id }}-${{ matrix.shard }}
+          MT5_SHARD: ${{ matrix.shard }}
+          MT5_SHARDS: ${{ needs.plan.outputs.count }}
           MT5_DURATION_SECONDS: '20700'
           MT5_SUPABASE_URL: ${{ secrets.MT5_SUPABASE_URL }}
           MT5_SUPABASE_KEY: ${{ secrets.MT5_SUPABASE_KEY }}
@@ -89,7 +119,8 @@ jobs:
           MT5_SNAPSHOT_SECONDS: '1'
           MT5_AI_ENABLED: '1'
           MT5_AI_INTERVAL: '5'
-          MT5_AI_SHARD: '0'
+          MT5_AI_SHARD: ${{ matrix.shard }}
+          MT5_AI_SHARDS: ${{ needs.plan.outputs.count }}
           MT5_ORDERFLOW: '1'
           KOMZ_ENABLED: '1'
           KOMZ_MODEL: ${{ vars.KOMZ_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b' }}
@@ -107,7 +138,7 @@ jobs:
         run: python mt5_worker.py
 
       - name: Chain next warm run
-        if: ${{ always() && vars.MT5_WARM_ENABLED != 'false' }}
+        if: ${{ always() && matrix.shard == 0 && vars.MT5_WARM_ENABLED != 'false' }}
         shell: pwsh
         env:
           MT5_DISPATCH_TOKEN: ${{ secrets.MT5_DISPATCH_TOKEN }}

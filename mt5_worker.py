@@ -32,6 +32,7 @@ DRY_RUN = os.environ.get("MT5_DRY_RUN") == "1"
 AI_ENABLED = os.environ.get("MT5_AI_ENABLED", "1") == "1"
 AI_INTERVAL = float(os.environ.get("MT5_AI_INTERVAL", "5"))
 AI_SHARD = int(os.environ.get("MT5_AI_SHARD", "0"))
+AI_SHARDS = max(1, int(os.environ.get("MT5_AI_SHARDS", "1")))
 
 HEADERS = {"X-Worker-Secret": SECRET, "Content-Type": "application/json"}
 WAKE = threading.Event()
@@ -145,9 +146,11 @@ def ai_loop(pool: TerminalPool) -> None:
         interval=AI_INTERVAL,
         on_account=ai_account_seen,
         brain=brain,
+        shard=AI_SHARD,
+        shards=AI_SHARDS,
     )
     log("komz brain online=%s model=%s" % (brain.available(), brain.model))
-    log("ai engine online interval=%ss magic=20261109" % AI_INTERVAL)
+    log("ai engine online interval=%ss magic=20261109 shard=%s/%s" % (AI_INTERVAL, AI_SHARD, AI_SHARDS))
     agent.run_forever(STOP)
 
 

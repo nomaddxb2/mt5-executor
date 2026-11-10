@@ -89,12 +89,13 @@ _SYMBOL_SUFFIXES = [
     "m", ".m", ".raw", "m.raw", ".m.raw", "z", ".z", ".a", ".pro", ".ecn", ".std",
     ".c", ".r", ".cash", ".mini", ".micro", ".plus", ".prime", ".zero", ".d", ".s",
     ".t", ".fx", ".spot", ".index", ".cfd", "-5", "#", "_i", ".i", ".sv", "_raw", "-raw",
+    "c", ".cent", "cent", "_cent", "-cent",
 ]
 _SYMBOL_PREFIXES = ["#", "x", "cfd", "fx", "mt5"]
 _SYMBOL_ALIASES = {
-    "XAUUSD": ["XAUUSD", "GOLD", "GOLDSPOT", "XAU/USD"],
+    "XAUUSD": ["XAUUSD", "GOLD", "GOLDUSD", "GOLDSPOT", "XAU/USD"],
     "XAGUSD": ["XAGUSD", "SILVER", "XAG/USD"],
-    "BTCUSD": ["BTCUSD", "BTCUSDT", "BITCOIN", "BTC"],
+    "BTCUSD": ["BTCUSD", "BTCUSDT", "XBTUSD", "BITCOIN", "BTC"],
     "ETHUSD": ["ETHUSD", "ETHUSDT", "ETHEREUM"],
     "US30": ["US30", "DJ30", "DOW30", "DOWJONES", "USA30", "WS30"],
     "NAS100": ["NAS100", "USTEC", "US100", "TECH100", "NDX100"],

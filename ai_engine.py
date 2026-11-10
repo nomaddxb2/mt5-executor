@@ -498,7 +498,7 @@ def learn(weights: Dict[str, float], contributions: Dict[str, float], reward: fl
     return {k: round(v / total, 5) for k, v in out.items()}
 
 
-def adapt(params: Dict[str, Any], stats: Dict[str, Any]) -> (Dict[str, Any], str):
+def adapt(params: Dict[str, Any], stats: Dict[str, Any], min_threshold: float = 0.15) -> (Dict[str, Any], str):
     p = dict(DEFAULT_PARAMS)
     p.update(params or {})
     trades = int(stats.get("trades") or 0)
@@ -520,7 +520,7 @@ def adapt(params: Dict[str, Any], stats: Dict[str, Any]) -> (Dict[str, Any], str
         if dd > 6:
             p["riskPct"] = max(0.1, float(p["riskPct"]) * 0.9)
             note = "Drawdown %.1f%% → cutting risk" % dd
-        p["threshold"] = round(_clamp(float(p["threshold"]), 0.15, 0.70), 4)
+        p["threshold"] = round(_clamp(float(p["threshold"]), float(min_threshold), 0.70), 4)
         p["riskPct"] = round(_clamp(float(p["riskPct"]), 0.1, 1.5), 3)
     return p, note
 
@@ -610,7 +610,7 @@ def initial_state() -> Dict[str, Any]:
 
 # ---------------------------------------------------------------- agent
 class AIAgent:
-    def __init__(self, pool, api, log, lock=None, interval: float = 5.0, on_account=None, brain=None):
+    def __init__(self, pool, api, log, lock=None, interval: float = 5.0, on_account=None, brain=None, shard: int = 0, shards: int = 1):
         self.pool = pool
         self.api = api
         self.log = log
@@ -618,6 +618,8 @@ class AIAgent:
         self.interval = interval
         self.on_account = on_account
         self.brain = brain
+        self.shard = int(shard or 0)
+        self.shards = max(1, int(shards or 1))
         self.accounts: List[Dict[str, Any]] = []
         self.last_refresh = 0.0
         self.cycle = 0
@@ -629,7 +631,7 @@ class AIAgent:
         if not force and self.accounts and time.time() - self.last_refresh < 5:
             return
         try:
-            payload = self.api("/v1/worker/ai/accounts", {})
+            payload = self.api("/v1/worker/ai/accounts", {"shard": self.shard, "shards": self.shards})
             self.accounts = payload.get("accounts") or []
             self.last_refresh = time.time()
             if self.accounts:
@@ -716,6 +718,10 @@ class AIAgent:
         komz_state["profile"] = profile
         weights = state.get("weights") or dict(DEFAULT_WEIGHTS)
         symbols = [str(s).upper() for s in (cfg.get("symbols") or [])][:6]
+        focus = [str(s).upper() for s in (cfg.get("focusSymbols") or [])][:4]
+        focus_set = {_base(s) for s in focus}
+        state["focusSymbols"] = focus
+        komz_state["focusSymbols"] = focus
         dry = bool(cfg.get("dryRun"))
         state["mode"] = "dry-run" if dry else "live"
         state["running"] = True
@@ -786,7 +792,8 @@ class AIAgent:
             state["startingEquity"] = equity
 
         rows = [analyze_symbol(sym, m["tfs"], m["quote"], weights, params, m.get("flow")) for sym, m in market.items()]
-        rows.sort(key=lambda r: r.get("confidence") or 0, reverse=True)
+        rows.sort(key=lambda r: (0 if _base(r.get("symbol")) in focus_set else 1, -(float(r.get("confidence") or 0))))
+        focus_available = any(_base(r.get("symbol")) in focus_set and r.get("ok") and r.get("side") for r in rows)
         by_symbol = {r.get("symbol"): r for r in rows if r.get("ok")}
 
         now = time.time()
@@ -975,6 +982,7 @@ class AIAgent:
         # open new positions
         open_count = len(state["positions"])
         open_symbols = {_base(p.get("symbol")) for p in state["positions"]}
+        non_focus_open = sum(1 for p in state["positions"] if focus_set and _base(p.get("symbol")) not in focus_set)
         reviews_done = 0
         for cand in rows:
             if not cand.get("ok") or not cand.get("side"):
@@ -985,6 +993,8 @@ class AIAgent:
             if open_count >= int(params.get("maxPositions", 3)):
                 break
             if sym in open_symbols:
+                continue
+            if focus_available and focus_set and _base(sym) not in focus_set and non_focus_open >= 2:
                 continue
             if now < cooldown_until:
                 continue
@@ -1096,6 +1106,8 @@ class AIAgent:
             state.setdefault("lastTradeAt", {})[sym] = now
             open_count += 1
             open_symbols.add(sym)
+            if focus_set and _base(sym) not in focus_set:
+                non_focus_open += 1
 
         # hold note for the top candidate
         top = rows[0] if rows else None
@@ -1132,7 +1144,7 @@ class AIAgent:
         closed = state.get("closed") or []
         stats = compute_stats(closed, float(state.get("startingEquity") or equity))
         state["stats"] = stats
-        params, learn_note = adapt(params, stats)
+        params, learn_note = adapt(params, stats, 0.08 if aggressive else 0.15)
         generation = int(stats.get("trades") or 0) // 20
         state["generation"] = generation
         state["params"] = params
