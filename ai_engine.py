@@ -1034,16 +1034,31 @@ class AIAgent:
                 })
                 continue
 
-            # virtual TP: arm a protective trail when price reaches the target
+            # virtual TP: only arm after target + spread; lock enough to cover the opposite side + target
             target_tp = float(entry.get("targetTp") or 0)
             if not dry and flip and atr_v > 0 and target_tp > 0 and not entry.get("tpArmed"):
-                hit = (side == "buy" and price >= target_tp) or (side == "sell" and price <= target_tp)
+                spread = abs(float(row.get("ask") or 0) - float(row.get("bid") or 0))
+                hit = (side == "buy" and price >= target_tp + spread) or (side == "sell" and price <= target_tp - spread)
                 if hit:
-                    buffer = max(atr_v * 0.05, 0.0)
-                    armed_sl = target_tp - buffer if side == "buy" else target_tp + buffer
+                    base = _base(pos.get("symbol"))
+                    opposite = next((p for p in ai_positions if _base(p.get("symbol")) == base and str(p.get("side") or "").lower() != side), None)
+                    opp_loss = max(0.0, -float((opposite or {}).get("profit") or 0.0))
+                    pair_key = entry.get("pairKey") or "%s:%s" % (base, str(side or "").upper())
+                    pair = (fr.get("pairs") or {}).get(pair_key) or {}
+                    target_usd = max(0.5, float(pair.get("deficit") or 0) + float(pair.get("missedProfit") or fr.get("missedProfit") or 0))
+                    tick_value = float((market.get(pos.get("symbol")) or {}).get("spec", {}).get("tickValue") or 1.0)
+                    tick_size = float((market.get(pos.get("symbol")) or {}).get("spec", {}).get("tickSize") or 0.00001)
+                    usd_per_price = (tick_value / tick_size) * float(entry.get("volume") or 0.01) if tick_size else 0.0
+                    need = (opp_loss + target_usd) / usd_per_price if usd_per_price > 0 else 0.0
+                    lock_sl = open_price + need if side == "buy" else open_price - need
+                    buffer = max(atr_v * 0.05, spread * 2.0, 0.0)
+                    armed_sl = max(target_tp + buffer, lock_sl) if side == "buy" else min(target_tp - buffer, lock_sl)
+                    can_arm = (side == "buy" and armed_sl < price) or (side == "sell" and armed_sl > price)
                     cur_sl = float(pos.get("stopLoss") or 0)
                     better = (side == "buy" and (cur_sl == 0 or armed_sl > cur_sl + 1e-9)) or (side == "sell" and (cur_sl == 0 or armed_sl < cur_sl - 1e-9))
-                    if better:
+                    if can_arm:
+                        entry["tpArmed"] = True
+                    if can_arm and better:
                         try:
                             with self._locked():
                                 self.pool.modify_position(creds, {"ticket": pos.get("ticket"), "stopLoss": round(armed_sl, _digits(price)), "takeProfit": 0})
@@ -1053,7 +1068,7 @@ class AIAgent:
                                 "id": "a%d" % int(time.time() * 1000), "at": _iso(), "action": "arm",
                                 "symbol": pos.get("symbol"), "side": side, "confidence": float(row.get("confidence") or 0),
                                 "price": price, "volume": pos.get("volume"),
-                                "reason": "Target %.5f reached; TP withheld, SL moved to %.5f and trailing armed." % (target_tp, armed_sl),
+                                "reason": "TP+spread %.5f reached; opposite loss $%.2f + target $%.2f; SL %.5f locks net profit." % (target_tp + spread if side == "buy" else target_tp - spread, opp_loss, target_usd, armed_sl),
                                 "ticket": pos.get("ticket"),
                             })
                         except Exception as e:
@@ -1206,13 +1221,18 @@ class AIAgent:
                     usd_per_price = (tick_value / tick_size) * lots if tick_size else 0.0
                     target_dist = (target_usd / usd_per_price) if usd_per_price > 0 else 0.7 * atr_v
                     width = max(0.7 * atr_v, min(target_dist, 4.0 * atr_v))
-                    buffer = max(0.05 * atr_v, 0.0)
+                    spread = abs(float(row.get("ask") or 0) - float(row.get("bid") or 0))
+                    buffer = max(0.05 * atr_v, spread * 2.0, 0.0)
                     if side == "buy":
                         target_tp = price + width
                         sl = price - width + buffer
                     else:
                         target_tp = price - width
                         sl = price + width - buffer
+                    opposite_before = next((p for p in state["positions"] if _base(p.get("symbol")) == base and str(p.get("side") or "").lower() != side and float(p.get("targetTp") or 0) > 0), None)
+                    if opposite_before:
+                        opp_tp = float(opposite_before.get("targetTp") or 0)
+                        sl = opp_tp - buffer if side == "sell" else opp_tp + buffer
                     risk_per_lot = abs(price - sl) * (tick_value / tick_size) if tick_size else abs(price - sl) * 100000.0
                     actual_risk = risk_per_lot * lots
                     if actual_risk > equity * 0.02:
@@ -1241,6 +1261,10 @@ class AIAgent:
                             "price": price, "volume": lots, "reason": "Hedge execution rejected: %s" % e,
                         })
                         continue
+                    pairs = fr.setdefault("pairs", {})
+                    pair["lot"] = lots
+                    pair["missedProfit"] = missed
+                    pairs[pair_key] = pair
                     state["positions"].append({
                         "ticket": ticket, "symbol": row.get("symbol"), "side": side, "volume": lots,
                         "openPrice": fill, "currentPrice": fill, "profit": 0,
