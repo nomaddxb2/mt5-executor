@@ -105,6 +105,8 @@ jobs:
           MT5_WORKER_SECRET: ${{ secrets.MT5_WORKER_SECRET }}
           MT5_SHARD: ${{ matrix.shard }}
           MT5_SHARDS: ${{ needs.plan.outputs.count }}
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
         run: python mt5_boot.py
 
       - name: Run warm worker
@@ -116,6 +118,8 @@ jobs:
           MT5_SHARD: ${{ matrix.shard }}
           MT5_SHARDS: ${{ needs.plan.outputs.count }}
           MT5_CONNECT_TIMEOUT_MS: '30000'
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
           MT5_DURATION_SECONDS: '20700'
           MT5_SUPABASE_URL: ${{ secrets.MT5_SUPABASE_URL }}
           MT5_SUPABASE_KEY: ${{ secrets.MT5_SUPABASE_KEY }}

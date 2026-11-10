@@ -17,7 +17,8 @@ SHARDS = max(1, int(os.environ.get("MT5_SHARDS") or 1))
 
 
 def out(*args):
-    print("[mt5-boot]", *args, flush=True)
+    text = " ".join(str(a).encode("ascii", "backslashreplace").decode("ascii") for a in args)
+    print("[mt5-boot] " + text, flush=True)
 
 
 def api(path, body):
