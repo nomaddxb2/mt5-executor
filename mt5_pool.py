@@ -603,6 +603,7 @@ class TerminalPool:
             "depthImbalance": round(depth_imbalance, 4),
             "tickDeltaRatio": round(tick_ratio, 4),
             "barDeltaRatio": round(bar_delta_ratio, 4),
+            "absorption": round(absorption, 4),
             "tickDelta": tick_data.get("tickDelta"),
             "buyVolume": tick_data.get("buyVolume"),
             "sellVolume": tick_data.get("sellVolume"),

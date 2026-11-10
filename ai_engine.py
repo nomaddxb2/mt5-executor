@@ -494,12 +494,115 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
         "flowAvailable": flow_available,
         "flowScore": round(flow_score, 3),
         "flowAlignment": round(flow_alignment, 3),
+        "barDeltaRatio": flow.get("barDeltaRatio"),
+        "absorption": flow.get("absorption"),
+        "macdHist": round(hist_v, 6),
+        "bbZ": round(z, 3),
         "flowPressure": flow.get("pressure"),
         "depthImbalance": flow.get("depthImbalance"),
         "tickDeltaRatio": flow.get("tickDeltaRatio"),
         "bidDepth": flow.get("bidDepth"),
         "askDepth": flow.get("askDepth"),
         "flowNotes": flow.get("notes") or [],
+    }
+
+
+def build_factor_board(rows: List[Dict[str, Any]], equity: float, drawdown_pct: float,
+                       fr: Dict[str, Any], research_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    research = (research_rows[-1] if research_rows else {}) or {}
+    macro_state = str(research.get("regime") or research.get("bias") or "unknown")
+    macro_note = str(((research.get("notes") or [""])[0]) or "research queued")[:140]
+    symbols: List[Dict[str, Any]] = []
+    aggregate: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        if not row.get("ok"):
+            continue
+        sig = row.get("signals") or {}
+        weights = row.get("weights") or {}
+        atr_v = float(row.get("atr") or 0)
+        spread = float(row.get("spread") or 0)
+        spread_atr = (spread / atr_v) if atr_v > 0 else 0.0
+        factors: List[Dict[str, Any]] = []
+
+        def add(key: str, label: str, score: float, weight: float, state: str, detail: str, source: str) -> None:
+            score = _clamp(float(score), -1.0, 1.0)
+            factors.append({
+                "key": key, "label": label, "score": round(score, 3), "weight": round(float(weight), 3),
+                "state": state, "detail": detail, "source": source,
+            })
+
+        add("orderflow", "Orderflow", float(row.get("flowScore") or 0), 0.22,
+            str(row.get("flowPressure") or "balanced"),
+            "DOM %+.2f · tick %+.2f · M5 delta %+.2f · absorption %+.2f" % (
+                float(row.get("depthImbalance") or 0), float(row.get("tickDeltaRatio") or 0),
+                float(row.get("barDeltaRatio") or 0), float(row.get("absorption") or 0)),
+            "DOM / ticks / M5")
+        for key, label, source in (("trend", "Trend", "EMA/ADX"), ("momentum", "Momentum", "MACD/RSI"),
+                                   ("breakout", "Structure", "swings"), ("meanrev", "Mean reversion", "Bollinger")):
+            item = sig.get(key) or {}
+            direction = int(item.get("dir") or 0)
+            strength = float(item.get("strength") or 0)
+            state = "up" if direction > 0 else "down" if direction < 0 else "flat"
+            detail = "%s %.2f" % (state, strength)
+            if key == "trend":
+                detail = "EMA20/50 %s · ADX %.1f" % (row.get("trend") or "flat", float(row.get("adx") or 0))
+            elif key == "momentum":
+                detail = "MACD %+.5f · RSI %.1f" % (float(row.get("macdHist") or 0), float(row.get("rsi") or 50))
+            elif key == "breakout":
+                detail = "20-bar range %s" % ("broken" if direction else "inside")
+            elif key == "meanrev":
+                detail = "BB z %+.2f" % float(row.get("bbZ") or 0)
+            add(key, label, direction * strength, float(weights.get(key) or 0), state, detail, source)
+        add("execution", "Execution", -_clamp(spread_atr / 0.35, 0.0, 1.0), 0.0,
+            "tight" if spread_atr <= 0.10 else "wide",
+            "spread %.5f · %.2f%% of ATR" % (spread, spread_atr * 100.0), "quote")
+        add("volatility", "Volatility", 0.0, 0.0, str(row.get("regime") or "range"),
+            "ATR %.5f · %.2f%% · ADX %.1f" % (atr_v, float(row.get("atrPct") or 0), float(row.get("adx") or 0)),
+            "M1/M5")
+        add("macro", "Macro / news", 0.0, 0.0, macro_state, macro_note, "Komz research")
+        add("risk", "Risk", -_clamp(drawdown_pct / 20.0, 0.0, 1.0), 0.0,
+            "high" if drawdown_pct >= 10 else "normal",
+            "drawdown %.1f%% · deficit $%.2f" % (drawdown_pct, float(fr.get("deficit") or 0)), "account")
+
+        directional = [f for f in factors if f["weight"] > 0]
+        total_w = sum(f["weight"] for f in directional) or 1.0
+        score = sum(f["score"] * f["weight"] for f in directional) / total_w
+        aligned = sum(1 for f in directional if f["score"] * score > 0)
+        confidence = abs(score) * (aligned / len(directional) if directional else 0.0)
+        bias = "buy" if score > 0.12 else "sell" if score < -0.12 else "neutral"
+        symbols.append({
+            "symbol": _base(row.get("symbol")), "bias": bias, "score": round(score, 3),
+            "confidence": round(confidence, 3), "regime": row.get("regime"),
+            "atrPct": row.get("atrPct"), "spreadAtr": round(spread_atr, 4),
+            "factors": factors,
+        })
+        for f in factors:
+            aggregate.setdefault(f["key"], []).append(f)
+
+    factors_out: List[Dict[str, Any]] = []
+    for key, values in aggregate.items():
+        scores = [v["score"] for v in values]
+        states = [v["state"] for v in values]
+        state = max(set(states), key=states.count) if states else "unknown"
+        factors_out.append({
+            "key": key, "label": values[0]["label"],
+            "score": round(sum(scores) / len(scores), 3),
+            "weight": round(sum(v["weight"] for v in values) / len(values), 3),
+            "state": state, "detail": values[0]["detail"], "source": values[0]["source"],
+            "symbols": len(values),
+        })
+    directional = [f for f in factors_out if f["weight"] > 0]
+    total_w = sum(f["weight"] for f in directional) or 1.0
+    score = sum(f["score"] * f["weight"] for f in directional) / total_w
+    bias = "buy" if score > 0.12 else "sell" if score < -0.12 else "neutral"
+    regimes = [s.get("regime") for s in symbols if s.get("regime")]
+    regime = max(set(regimes), key=regimes.count) if regimes else "range"
+    confidence = sum(float(s.get("confidence") or 0) for s in symbols) / len(symbols) if symbols else 0.0
+    return {
+        "updatedAt": _iso(), "bias": bias, "score": round(score, 3),
+        "confidence": round(confidence, 3), "regime": regime,
+        "factors": factors_out, "symbols": symbols,
+        "observations": len(symbols), "equity": round(float(equity or 0), 2),
     }
 
 
@@ -1187,13 +1290,40 @@ class AIAgent:
         research_rows = komz_state.get("research") or []
         research_note = str(((research_rows[-1] or {}).get("notes") or [""])[0])[:140] if research_rows else "research queued"
         hedge_bits = ", ".join("%s %s" % (_base(p.get("symbol")), str(p.get("side") or "").upper()) for p in state.get("positions") or [] if p.get("hedge")) or "opening"
+        factor_board = build_factor_board(rows, equity, drawdown_pct, fr, research_rows)
+        history = list(komz_state.get("factorHistory") or [])
+        history.append({"at": factor_board["updatedAt"], "bias": factor_board["bias"],
+                        "score": factor_board["score"], "confidence": factor_board["confidence"],
+                        "regime": factor_board["regime"]})
+        komz_state["factorHistory"] = history[-60:]
+        factor_board["observations"] = len(komz_state["factorHistory"])
+        komz_state["factorBoard"] = factor_board
+        if int(state.get("cycle") or 0) % 20 == 0:
+            state.setdefault("thoughts", []).append({
+                "at": _iso(),
+                "text": "Factor board %s %.2f (%s): orderflow, trend, momentum, structure, macro and risk are on the board." % (
+                    factor_board["bias"].upper(), factor_board["score"], factor_board["regime"]),
+            })
+        best_flow = max(rows, key=lambda r: abs(float(r.get("flowScore") or 0))) if rows else {}
+        best_flow_sym = _base(best_flow.get("symbol")) if best_flow else "none"
+        flow_note = "orderflow %s %+.2f · DOM %+.2f · tick %+.2f" % (
+            best_flow.get("flowPressure") or "balanced", float(best_flow.get("flowScore") or 0),
+            float(best_flow.get("depthImbalance") or 0), float(best_flow.get("tickDeltaRatio") or 0)) if best_flow else "orderflow warming"
+        structure_note = "structure %s · regime %s" % (
+            (best.get("side") or "neutral").upper() if best else "neutral", factor_board["regime"])
         jobs = []
         job_defs = [
             ("Data", "live quotes, ATR, spread and orderflow", "%d live symbols · best %s %.2f · quotes current" % (len(rows), best_sym, float(best.get("confidence") or 0))),
+            ("Orderflow", "DOM, tick delta, M5 delta and absorption", "%s · %s" % (best_flow_sym, flow_note)),
+            ("Structure", "swings, range position and liquidity", structure_note),
             ("Tests", "SL/TP presence, unbounded per-pair ladder, 5% flip cap", "SL/TP fields present · ladders %s · 5%% flip cap active" % (pair_bits or "none")),
             ("Research", "news, regime and session context", research_note),
+            ("Macro", "USD, yields and cross-asset regime", "%s · %s" % (factor_board["regime"], research_note)),
             ("Risk", "drawdown, pair recovery lots and missed profit", "drawdown %.1f%% · multiplier %.2fx · deficit $%.2f" % (drawdown_pct, risk_mult, float(fr.get("deficit") or 0))),
             ("Hedge", "two-sided BTC/Gold grid, side ladders, opposite TP/SL alignment", "active %s · side ladders %s" % (hedge_bits, pair_bits or "none")),
+            ("Execution", "spread/ATR, fills and slippage", "best spread/ATR %s · %d symbols" % (
+                min([("%s %.3f" % (s.get("symbol"), float(s.get("spreadAtr") or 0))) for s in factor_board["symbols"]], default="—"),
+                len(factor_board["symbols"]))),
             ("Profit", "win rate, profit factor and expectancy", "PF %.2f · expectancy %.2f · win %.1f%%" % (float(stats.get("profitFactor") or 0), float(stats.get("expectancy") or 0), float(stats.get("winRate") or 0) * 100.0)),
         ]
         for i, (role, task, finding) in enumerate(job_defs):
