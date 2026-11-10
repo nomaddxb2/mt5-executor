@@ -566,7 +566,8 @@ class KomzCouncil:
             "You are the Portfolio Chair of Komz's agent family. Decide whether the deterministic candidate is worth trading now. "
             "Protect capital, but do not demand perfection: LO wants more good trades, recoveries and discoveries. "
             "Approve when there is a coherent edge and no hard risk violation. Reject on genuine danger. "
-            "The active confidence threshold is %.2f; do not reject solely because confidence is below 0.55 or because the family is split. " % min_conf
+            "The active confidence threshold is %.2f; do not reject solely because confidence is below 0.55 or because the family is split. "
+            "The deterministic engine already enforces the 2% min-lot risk cap; do not infer a cap breach from the existence of open positions. " % min_conf
             + ("Aggressive mode is active: prefer a coherent trade over waiting for unanimity. Approve a strong deterministic edge with size_multiplier 0.5-0.75 even if the family is split; reject only on hard risk, event danger, or a strong Risk Guardian veto. " if aggressive else "")
             + "Return ONLY one strict JSON object."
         )
@@ -750,15 +751,22 @@ class KomzBrain:
 
     def _portfolio(self, info: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
         equity = float(info.get("equity") or info.get("balance") or state.get("equity") or 0)
+        positions = list(state.get("positions") or [])
+        pnls = [float(p.get("profit") or 0) for p in positions]
         return {
             "balance": round(float(info.get("balance") or 0), 2),
             "equity": round(equity, 2),
             "floating": round(float(state.get("floating") or 0), 2),
             "todayPnl": state.get("todayPnl"),
             "aiPnl": state.get("aiPnl"),
+            "openCount": len(positions),
+            "floatingWins": sum(1 for p in pnls if p > 0),
+            "floatingLosses": sum(1 for p in pnls if p < 0),
+            "floatingGross": round(sum(pnls), 2),
+            "largestFloatingLoss": round(min([p for p in pnls if p < 0] or [0]), 2),
             "openPositions": [
                 {k: p.get(k) for k in ("ticket", "symbol", "side", "volume", "openPrice", "profit", "sl", "tp")}
-                for p in (state.get("positions") or [])[:6]
+                for p in positions[:6]
             ],
             "stats": state.get("stats"),
         }
@@ -798,6 +806,7 @@ class KomzBrain:
             "recovery": state.get("komz", {}).get("recovery"),
             "rules": {
                 "minLotRiskCapPct": 2.0,
+                "riskCapEnforcedByEngine": True,
                 "profile": state.get("profile") or "balanced",
                 "minConfidence": state.get("params", {}).get("minConfidence"),
                 "maxPositions": state.get("params", {}).get("maxPositions"),
@@ -812,6 +821,8 @@ class KomzBrain:
             "You are disciplined, adaptive and research-driven: protect capital first, compound second, recover without revenge trading. "
             "The deterministic engine gives you a candidate. You may only approve or reject that candidate; never invent a trade, never change volume, never exceed the 2% min-lot risk cap. "
             "Use the active confidence threshold in context.rules.minConfidence; never import a fixed 0.55 threshold. "
+            "The deterministic engine already enforces the 2% min-lot risk cap; do not claim a cap breach unless the portfolio fields explicitly show one. "
+            "Open positions with small floating P/L do not by themselves breach the cap. "
             "If the setup is unclear, reject. Learn from every outcome and keep a compact, reusable playbook. "
             "Return ONLY one strict JSON object with the requested keys. No markdown, no prose outside JSON."
         )
@@ -850,7 +861,7 @@ class KomzBrain:
         context["candidate"] = context["candidates"][0] if context["candidates"] else {}
         user = (
             "Review this deterministic candidate. Approve only if the edge is coherent, spread/ATR is sane, "
-            "the portfolio is not overexposed, and recovery rules are respected.\n"
+            "the portfolio is not overexposed, and recovery rules are respected. The engine already enforces the 2% cap; judge setup quality, not an inferred breach.\n"
             + json.dumps(context, separators=(",", ":"))[:7000]
             + '\nReturn JSON: {"action":"approve|reject","confidence":0.0,"reason":"one sentence","risk_note":"one sentence","lesson":"optional one sentence"}'
         )
