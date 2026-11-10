@@ -201,7 +201,7 @@ class KomzMemory:
             path = "komz/%s/%s-%s-%02d.txt" % (safe_account, stamp, kind, index)
             url = "%s/storage/v1/object/%s/%s" % (self.supabase_url, SUPABASE_BUCKET, urllib.parse.quote(path))
             try:
-                res = requests.put(
+                res = requests.post(
                     url,
                     headers={
                         "Authorization": "Bearer " + self.supabase_key,
