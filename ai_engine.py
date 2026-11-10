@@ -742,8 +742,8 @@ class AIAgent:
         if cfg.get("minConfidence") is not None:
             params["threshold"] = min(float(params.get("threshold", 0.15)), float(params["minConfidence"]))
         if flip:
-            params["minConfidence"] = max(0.25, float(params.get("minConfidence") or 0.25))
-            params["threshold"] = max(0.25, float(params.get("threshold") or 0.25))
+            params["minConfidence"] = min(float(params.get("minConfidence") or 0.05), 0.05)
+            params["threshold"] = min(float(params.get("threshold") or 0.05), 0.05)
         state["profile"] = profile
         state["flipMode"] = bool(flip)
         komz_state["profile"] = profile
@@ -840,7 +840,7 @@ class AIAgent:
                     age = now - datetime.fromisoformat(str(rec.get("closedAt") or "").replace("Z", "+00:00")).timestamp()
                 except Exception:
                     continue
-                if age < 300 and float(rec.get("pnl") or 0) < 0:
+                if age < 60 and float(rec.get("pnl") or 0) < 0:
                     recent_losses[sym0] = rec
         current_tickets = {str(p.get("ticket")) for p in ai_positions}
         previous = list(state.get("positions") or [])
@@ -997,8 +997,10 @@ class AIAgent:
         state["todayPnl"] = round(today_pnl, 2)
         loss_limit = -abs(equity * float(params.get("maxDailyLossPct", 3)) / 100.0)
         halted = bool(equity and today_pnl <= loss_limit)
+        if flip:
+            halted = False
         state["halted"] = halted
-        cooldown_until = float(state.get("cooldownUntil") or 0)
+        cooldown_until = 0.0 if flip else float(state.get("cooldownUntil") or 0)
 
         peak = max(float(state.get("peakEquity") or equity or 0), float(equity or 0))
         state["peakEquity"] = peak
@@ -1011,12 +1013,22 @@ class AIAgent:
         elif drawdown_pct >= 2.5:
             risk_mult = 0.75
         if flip:
-            risk_mult = 1.0
+            base_risk = max(float(params.get("riskPct", 1.5)), 0.1)
+            if drawdown_pct >= 10.0:
+                risk_mult = min(1.33, 2.0 / base_risk)
+            elif drawdown_pct >= 5.0:
+                risk_mult = min(1.25, 2.0 / base_risk)
+            elif drawdown_pct >= 2.5:
+                risk_mult = min(1.15, 2.0 / base_risk)
+            else:
+                risk_mult = 1.0
         komz_state["recovery"] = {
-            "active": risk_mult < 1.0,
+            "active": bool(flip and drawdown_pct > 0) or risk_mult < 1.0,
+            "mode": "recovery" if flip and drawdown_pct > 0 else "protect",
             "drawdownPct": round(drawdown_pct, 2),
             "riskMultiplier": risk_mult,
             "peakEquity": round(peak, 2),
+            "targetEquity": round(peak, 2),
             "flipOverride": bool(flip),
         }
         start_equity = float(state.get("startingEquity") or equity or 0)
@@ -1051,7 +1063,7 @@ class AIAgent:
                         "id": "q%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
                         "symbol": sym, "side": None, "confidence": cand.get("confidence"),
                         "price": price, "volume": None,
-                        "reason": "Flip re-entry guard: last %s trade lost; waiting 5 minutes." % _base(sym),
+                        "reason": "Flip recovery: last %s trade lost; waiting 60 seconds." % _base(sym),
                     })
                     state.setdefault("lastReentryHoldAt", {})[key] = now
                 continue

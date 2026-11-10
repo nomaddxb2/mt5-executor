@@ -879,7 +879,7 @@ class KomzBrain:
         if action in ("reject", "hold", "no", "wait", "skip"):
             approve = False
         confidence = _clamp(parsed.get("confidence"), 0.0, 1.0, 0.5)
-        if confidence < (0.25 if flip else 0.35):
+        if confidence < (0.05 if flip else 0.35):
             approve = False
         result = {
             "action": "approve" if approve else "reject",
