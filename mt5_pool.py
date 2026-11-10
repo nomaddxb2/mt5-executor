@@ -560,31 +560,59 @@ class TerminalPool:
             bars = self.rates(credentials, symbol, "M5", 120)
         except Exception:
             bars = []
-        bar_delta = 0.0
-        bar_volume = 0.0
-        absorption = 0.0
-        if bars:
-            recent = bars[-40:]
+        m1_bars: List[Dict[str, Any]] = []
+        try:
+            m1_bars = self.rates(credentials, symbol, "M1", 120)
+        except Exception:
+            m1_bars = []
+
+        def _delta(rows: List[Dict[str, Any]], lookback: int = 24):
+            delta = 0.0
+            volume_total = 0.0
+            absorb = 0.0
+            if not rows:
+                return 0.0, 0.0, 0.0
+            recent = rows[-40:]
             vols = [float(b.get("tickVolume") or 0) for b in recent]
             mean_vol = sum(vols) / len(vols) if vols else 0.0
             var = sum((v - mean_vol) ** 2 for v in vols) / len(vols) if vols else 0.0
             sd = math.sqrt(var) if var > 0 else 0.0
-            for b in recent[-24:]:
+            for b in recent[-lookback:]:
                 high = float(b.get("high") or 0)
                 low = float(b.get("low") or 0)
                 close = float(b.get("close") or 0)
                 volume = float(b.get("tickVolume") or 0)
                 rng = high - low
                 pos = ((close - low) / rng) if rng > 0 else 0.5
-                delta = volume * (2.0 * pos - 1.0)
-                bar_delta += delta
-                bar_volume += volume
+                bar_delta = volume * (2.0 * pos - 1.0)
+                delta += bar_delta
+                volume_total += volume
                 if mean_vol > 0 and volume > mean_vol + 1.5 * sd and rng > 0:
-                    absorption += (-delta) * 0.15
+                    absorb += (-bar_delta) * 0.15
+            return delta, volume_total, absorb
+
+        bar_delta, bar_volume, absorption = _delta(bars)
+        m1_delta, m1_volume, m1_absorption = _delta(m1_bars)
         bar_delta_ratio = (bar_delta / bar_volume) if bar_volume else 0.0
+        m1_delta_ratio = (m1_delta / m1_volume) if m1_volume else 0.0
         depth_imbalance = float(depth_data.get("depthImbalance") or 0.0)
         tick_ratio = float(tick_data.get("tickDeltaRatio") or 0.0)
-        score = _clamp(0.45 * depth_imbalance + 0.35 * tick_ratio + 0.20 * bar_delta_ratio + absorption, -1.0, 1.0)
+        depth_available = bool(depth_data.get("available"))
+        tick_available = bool(tick_data.get("available")) and int(tick_data.get("ticks") or 0) > 0
+        bar_available = bool(bar_volume)
+        m1_available = bool(m1_volume)
+        parts = []
+        if depth_available:
+            parts.append((depth_imbalance, 0.35))
+        if tick_available:
+            parts.append((tick_ratio, 0.25))
+        if bar_available:
+            parts.append((_clamp(bar_delta_ratio + absorption, -1.0, 1.0), 0.25))
+        if m1_available:
+            parts.append((_clamp(m1_delta_ratio + m1_absorption, -1.0, 1.0), 0.15))
+        total_weight = sum(w for _, w in parts)
+        score = sum(v * w for v, w in parts) / total_weight if total_weight else 0.0
+        quality = min(1.0, total_weight / 1.0)
         pressure = "buyers" if score > 0.15 else "sellers" if score < -0.15 else "balanced"
         bid = float((quote or {}).get("bid") or depth_data.get("bestBid") or 0.0)
         ask = float((quote or {}).get("ask") or depth_data.get("bestAsk") or 0.0)
@@ -594,8 +622,12 @@ class TerminalPool:
             notes.append("Ticks %s: delta %+.2f (%+.1f%%)" % (pressure, tick_data.get("tickDelta") or 0, tick_ratio * 100))
         if bar_delta_ratio:
             notes.append("M5 volume delta %+.1f%%" % (bar_delta_ratio * 100))
+        if m1_delta_ratio:
+            notes.append("M1 volume delta %+.1f%%" % (m1_delta_ratio * 100))
+        if quality:
+            notes.append("Orderflow quality %.0f%%" % (quality * 100))
         return {
-            "available": bool(tick_data.get("available") or depth_data.get("available") or bars),
+            "available": bool(tick_data.get("available") or depth_data.get("available") or bar_available or m1_available),
             "symbol": symbol,
             "brokerSymbol": broker,
             "score": round(score, 4),
@@ -603,7 +635,13 @@ class TerminalPool:
             "depthImbalance": round(depth_imbalance, 4),
             "tickDeltaRatio": round(tick_ratio, 4),
             "barDeltaRatio": round(bar_delta_ratio, 4),
+            "m1DeltaRatio": round(m1_delta_ratio, 4),
             "absorption": round(absorption, 4),
+            "m1Absorption": round(m1_absorption, 4),
+            "quality": round(quality, 3),
+            "depthAvailable": depth_available,
+            "tickAvailable": tick_available,
+            "barAvailable": bar_available,
             "tickDelta": tick_data.get("tickDelta"),
             "buyVolume": tick_data.get("buyVolume"),
             "sellVolume": tick_data.get("sellVolume"),

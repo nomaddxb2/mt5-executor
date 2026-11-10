@@ -435,7 +435,7 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
         ))
         if side:
             flow_alignment = flow_score if side == "buy" else -flow_score
-            confidence = _clamp(confidence + flow_alignment * 0.10, 0.0, 1.0)
+            confidence = _clamp(confidence + flow_alignment * 0.10 * float(flow.get("quality") or 0.5), 0.0, 1.0)
             if flow_alignment < -0.30:
                 hold_reason = "Orderflow opposes %s: %s" % (side.upper(), flow.get("pressure") or "heavy opposite pressure")
                 side = None
@@ -495,7 +495,9 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
         "flowScore": round(flow_score, 3),
         "flowAlignment": round(flow_alignment, 3),
         "barDeltaRatio": flow.get("barDeltaRatio"),
+        "m1DeltaRatio": flow.get("m1DeltaRatio"),
         "absorption": flow.get("absorption"),
+        "flowQuality": flow.get("quality"),
         "macdHist": round(hist_v, 6),
         "bbZ": round(z, 3),
         "flowPressure": flow.get("pressure"),
@@ -531,12 +533,14 @@ def build_factor_board(rows: List[Dict[str, Any]], equity: float, drawdown_pct: 
                 "state": state, "detail": detail, "source": source,
             })
 
-        add("orderflow", "Orderflow", float(row.get("flowScore") or 0), 0.22,
+        flow_quality = float(row.get("flowQuality") or 0.0)
+        add("orderflow", "Orderflow", float(row.get("flowScore") or 0), 0.22 * max(0.25, flow_quality),
             str(row.get("flowPressure") or "balanced"),
-            "DOM %+.2f · tick %+.2f · M5 delta %+.2f · absorption %+.2f" % (
+            "DOM %+.2f · tick %+.2f · M5 %+.2f · M1 %+.2f · absorption %+.2f · quality %.0f%%" % (
                 float(row.get("depthImbalance") or 0), float(row.get("tickDeltaRatio") or 0),
-                float(row.get("barDeltaRatio") or 0), float(row.get("absorption") or 0)),
-            "DOM / ticks / M5")
+                float(row.get("barDeltaRatio") or 0), float(row.get("m1DeltaRatio") or 0),
+                float(row.get("absorption") or 0), flow_quality * 100.0),
+            "DOM / ticks / M5+M1")
         for key, label, source in (("trend", "Trend", "EMA/ADX"), ("momentum", "Momentum", "MACD/RSI"),
                                    ("breakout", "Structure", "swings"), ("meanrev", "Mean reversion", "Bollinger")):
             item = sig.get(key) or {}
@@ -1160,6 +1164,8 @@ class AIAgent:
                 continue
 
             # virtual TP: only arm after target + spread; lock enough to cover the opposite side + target
+            if flip and float(entry.get("targetTp") or 0) <= 0 and atr_v > 0 and open_price > 0:
+                entry["targetTp"] = round(open_price + (0.7 * atr_v if side == "buy" else -0.7 * atr_v), _digits(price))
             target_tp = float(entry.get("targetTp") or 0)
             if not dry and flip and atr_v > 0 and target_tp > 0 and not entry.get("tpArmed"):
                 spread = abs(float(row.get("ask") or 0) - float(row.get("bid") or 0))
@@ -1394,14 +1400,34 @@ class AIAgent:
                         sl = opp_tp - buffer if side == "sell" else opp_tp + buffer
                     risk_per_lot = abs(price - sl) * (tick_value / tick_size) if tick_size else abs(price - sl) * 100000.0
                     actual_risk = risk_per_lot * lots
-                    if actual_risk > equity * 0.05:
-                        state["decisions"].append({
-                            "id": "h%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
-                            "symbol": base, "side": side, "confidence": float(row.get("confidence") or 0),
-                            "price": price, "volume": lots,
-                            "reason": "Hedge skipped: %.2f lot risk $%.2f is above the 5.0%% flip cap." % (lots, actual_risk),
-                        })
-                        continue
+                    broken = False
+                    if actual_risk > equity * 0.05 and risk_per_lot > 0:
+                        max_lots = (equity * 0.05) / risk_per_lot
+                        if vstep > 0:
+                            max_lots = math.floor((max_lots + 1e-9) / vstep) * vstep
+                        max_lots = max(vmin, min(vmax, max_lots))
+                        if max_lots < vmin or max_lots <= 0:
+                            state["decisions"].append({
+                                "id": "h%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
+                                "symbol": base, "side": side, "confidence": float(row.get("confidence") or 0),
+                                "price": price, "volume": lots,
+                                "reason": "Hedge skipped: even min lot risk exceeds the 5.0%% flip cap." % (),
+                            })
+                            continue
+                        lots = max_lots
+                        broken = True
+                        actual_risk = risk_per_lot * lots
+                        usd_per_price = (tick_value / tick_size) * lots if tick_size else 0.0
+                        target_dist = (target_usd / usd_per_price) if usd_per_price > 0 else 0.7 * atr_v
+                        width = max(0.7 * atr_v, min(target_dist, 4.0 * atr_v))
+                        if opposite_before:
+                            opp_tp = float(opposite_before.get("targetTp") or 0)
+                            sl = opp_tp - buffer if side == "sell" else opp_tp + buffer
+                        else:
+                            sl = price - width + buffer if side == "buy" else price + width - buffer
+                        target_tp = price + width if side == "buy" else price - width
+                        risk_per_lot = abs(price - sl) * (tick_value / tick_size) if tick_size else abs(price - sl) * 100000.0
+                        actual_risk = risk_per_lot * lots
                     try:
                         with self._locked():
                             res = self.pool.open_position(creds, {
@@ -1425,6 +1451,7 @@ class AIAgent:
                     pair["ladderLot"] = round(ladder_lot, 4)
                     pair["requiredLot"] = round(required_lot, 4)
                     pair["lotAdded"] = round(max(0.0, lots - ladder_lot), 4)
+                    pair["lotBroken"] = bool(broken)
                     pair["missedProfit"] = missed
                     pairs[pair_key] = pair
                     open_count += 1
@@ -1441,7 +1468,7 @@ class AIAgent:
                         "id": "ho%d" % int(time.time() * 1000), "at": _iso(), "action": side,
                         "symbol": base, "side": side, "confidence": float(row.get("confidence") or 0),
                         "price": fill, "volume": lots,
-                        "reason": "Flip hedge: %s %.2f lots (ladder %.2f, added %.2f for $%.2f demand); SL %.5f near opposite TP; virtual TP %.5f; ladder step %d." % (side.upper(), lots, ladder_lot, max(0.0, lots - ladder_lot), target_usd, sl, target_tp, step),
+                        "reason": "Flip hedge: %s %.2f lots (ladder %.2f, added %.2f for $%.2f demand%s); SL %.5f near opposite TP; virtual TP %.5f; ladder step %d." % (side.upper(), lots, ladder_lot, max(0.0, lots - ladder_lot), target_usd, ", risk-capped" if broken else "", sl, target_tp, step),
                     })
                     opposite = next((p for p in state["positions"] if _base(p.get("symbol")) == base and str(p.get("side") or "").lower() != side and not p.get("tpArmed")), None)
                     if opposite:
