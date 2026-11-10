@@ -167,13 +167,16 @@ class TerminalPool:
         except Exception:
             pass
         started = time.time()
-        timeout_ms = int(os.environ.get("MT5_CONNECT_TIMEOUT_MS", "120000"))
+        timeout_ms = int(os.environ.get("MT5_CONNECT_TIMEOUT_MS", "30000"))
         last_code, last_message = -1, "unknown"
         ok = False
+        print("[mt5-pool] attach login=%s server=%s timeout=%sms" % (key[0], key[1], timeout_ms), flush=True)
         # Attach to the terminal that the warm workflow already started.
         try:
             ok = mt5.initialize(path=TERMINAL_PATH, timeout=timeout_ms, portable=True)
-        except Exception:
+            print("[mt5-pool] initialize=%s error=%s" % (ok, mt5.last_error()), flush=True)
+        except Exception as exc:
+            print("[mt5-pool] initialize exception=%s" % exc, flush=True)
             ok = False
         if ok:
             ai = mt5.account_info()
@@ -189,7 +192,9 @@ class TerminalPool:
                     pass
         # Restart the terminal with an explicit startup config that enables AutoTrading.
         if not ok:
+            print("[mt5-pool] attach failed, restarting terminal", flush=True)
             ok = self._restart_with_experts(credentials)
+            print("[mt5-pool] restart result=%s" % ok, flush=True)
         for attempt in range(3):
             if ok:
                 break

@@ -97,11 +97,15 @@ jobs:
           if (!(Test-Path 'C:\mt5\terminal64.exe')) { throw 'C:\mt5\terminal64.exe is missing' }
           python -c "import MetaTrader5 as mt5; print('MetaTrader5', mt5.__version__)"
 
-      - name: Diagnose MT5 IPC
+      - name: Boot MT5 session
         shell: pwsh
-        timeout-minutes: 5
-        continue-on-error: true
-        run: python mt5_diag.py
+        timeout-minutes: 4
+        env:
+          MT5_API_URL: ${{ secrets.MT5_API_URL }}
+          MT5_WORKER_SECRET: ${{ secrets.MT5_WORKER_SECRET }}
+          MT5_SHARD: ${{ matrix.shard }}
+          MT5_SHARDS: ${{ needs.plan.outputs.count }}
+        run: python mt5_boot.py
 
       - name: Run warm worker
         shell: pwsh
@@ -111,6 +115,7 @@ jobs:
           MT5_WORKER_ID: github-${{ github.run_id }}-${{ matrix.shard }}
           MT5_SHARD: ${{ matrix.shard }}
           MT5_SHARDS: ${{ needs.plan.outputs.count }}
+          MT5_CONNECT_TIMEOUT_MS: '30000'
           MT5_DURATION_SECONDS: '20700'
           MT5_SUPABASE_URL: ${{ secrets.MT5_SUPABASE_URL }}
           MT5_SUPABASE_KEY: ${{ secrets.MT5_SUPABASE_KEY }}
