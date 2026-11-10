@@ -739,6 +739,9 @@ class AIAgent:
             params["maxDailyLossPct"] = max(float(params.get("maxDailyLossPct", 3)), 4.0)
         if cfg.get("minConfidence") is not None:
             params["threshold"] = min(float(params.get("threshold", 0.15)), float(params["minConfidence"]))
+        if flip:
+            params["minConfidence"] = max(0.25, float(params.get("minConfidence") or 0.25))
+            params["threshold"] = max(0.25, float(params.get("threshold") or 0.25))
         state["profile"] = profile
         state["flipMode"] = bool(flip)
         komz_state["profile"] = profile
@@ -825,6 +828,18 @@ class AIAgent:
         by_symbol = {r.get("symbol"): r for r in rows if r.get("ok")}
 
         now = time.time()
+        recent_losses = {}
+        if flip:
+            for rec in reversed(state.get("closed") or []):
+                sym0 = _base(rec.get("symbol"))
+                if not sym0 or sym0 in recent_losses:
+                    continue
+                try:
+                    age = now - datetime.fromisoformat(str(rec.get("closedAt") or "").replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    continue
+                if age < 300 and float(rec.get("pnl") or 0) < 0:
+                    recent_losses[sym0] = rec
         current_tickets = {str(p.get("ticket")) for p in ai_positions}
         previous = list(state.get("positions") or [])
         closed_now: List[Dict[str, Any]] = []
@@ -1025,6 +1040,19 @@ class AIAgent:
                 break
             if sym in open_symbols:
                 continue
+            price = float(cand.get("price") or 0)
+            if flip and _base(sym) in recent_losses:
+                key = "%s:reentry" % _base(sym)
+                last_note = float((state.get("lastReentryHoldAt") or {}).get(key) or 0)
+                if now - last_note > 60:
+                    state["decisions"].append({
+                        "id": "q%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
+                        "symbol": sym, "side": None, "confidence": cand.get("confidence"),
+                        "price": price, "volume": None,
+                        "reason": "Flip re-entry guard: last %s trade lost; waiting 5 minutes." % _base(sym),
+                    })
+                    state.setdefault("lastReentryHoldAt", {})[key] = now
+                continue
             if focus_available and focus_set and _base(sym) not in focus_set and non_focus_open >= 2:
                 continue
             if now < cooldown_until:
@@ -1033,7 +1061,7 @@ class AIAgent:
             if now - last_at < float(params.get("cooldownSec", 180)):
                 continue
             spec = (market.get(sym) or {}).get("spec") or {}
-            price = float(cand.get("ask") if cand.get("side") == "buy" else cand.get("bid"))
+            price = float(cand.get("ask") or cand.get("bid") or price)
             sl = float(cand.get("sl") or 0)
             sl_dist = abs(price - sl)
             lots = position_size(equity, risk_pct, sl_dist, spec)
