@@ -23,8 +23,8 @@ DEFAULT_PARAMS = {
     "atrTp": 3.2,
     "trailAt": 1.2,
     "trailDistance": 1.2,
-    "threshold": 0.40,
-    "minConfidence": 0.40,
+    "threshold": 0.30,
+    "minConfidence": 0.30,
     "riskPct": 0.5,
     "maxPositions": 3,
     "maxDailyLossPct": 3.0,
@@ -349,7 +349,7 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
     confidence = abs(score)
     side = "buy" if score > 0 else "sell" if score < 0 else None
 
-    threshold = max(float(params.get("threshold", 0.40)), float(params.get("minConfidence", 0.40)))
+    threshold = max(float(params.get("threshold", 0.30)), float(params.get("minConfidence", 0.30)))
     reasons: List[str] = []
     hold_reason = ""
 
@@ -688,11 +688,21 @@ class AIAgent:
                 komz_state.update(self.brain.status())
             except Exception as e:
                 self.log("komz status failed: %s" % e)
+
+        def progress():
+            if self.brain:
+                try:
+                    komz_state.update(self.brain.status())
+                except Exception:
+                    pass
+            self._post(account_id, state)
         params = dict(DEFAULT_PARAMS)
         params.update(state.get("params") or {})
         for key in ("riskPct", "maxPositions", "minConfidence", "maxDailyLossPct"):
             if cfg.get(key) is not None:
                 params[key] = cfg[key]
+        if cfg.get("minConfidence") is not None:
+            params["threshold"] = min(float(params.get("threshold", 0.30)), float(params["minConfidence"]))
         weights = state.get("weights") or dict(DEFAULT_WEIGHTS)
         symbols = [str(s).upper() for s in (cfg.get("symbols") or [])][:6]
         dry = bool(cfg.get("dryRun"))
@@ -952,7 +962,7 @@ class AIAgent:
         # open new positions
         open_count = len(state["positions"])
         open_symbols = {_base(p.get("symbol")) for p in state["positions"]}
-        reviewed = False
+        reviews_done = 0
         for cand in rows:
             if not cand.get("ok") or not cand.get("side"):
                 continue
@@ -993,14 +1003,15 @@ class AIAgent:
                     state.setdefault("lastRiskHoldAt", {})[sym] = now
                 continue
             review = None
-            if use_brain and not reviewed:
-                reviewed = True
+            if use_brain and reviews_done < 2:
+                reviews_done += 1
                 try:
-                    review = self.brain.review_entry(account_id, cfg, state, cand, market, info)
+                    review = self.brain.review_entry(account_id, cfg, state, cand, market, info, progress=progress)
                 except Exception as e:
                     self.log("komz review failed: %s" % e)
                 if review:
                     komz_state["lastReview"] = review
+                    komz_state["council"] = review.get("council") or self.brain.council.status()
                     if review.get("action") == "reject":
                         state["decisions"].append({
                             "id": "k%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
@@ -1051,6 +1062,8 @@ class AIAgent:
                 "confidence": cand.get("confidence"), "price": fill, "volume": lots,
                 "reason": " ".join(cand.get("reasons") or []) + (
                     (" · Komz: " + str((cand.get("komzReview") or {}).get("reason") or "")) if cand.get("komzReview") else ""
+                ) + (
+                    (" · Council: " + str(((cand.get("komzReview") or {}).get("council") or {}).get("summary") or "")) if (cand.get("komzReview") or {}).get("council") else ""
                 ),
                 "ticket": ticket, "outcome": None, "pnl": None,
             }

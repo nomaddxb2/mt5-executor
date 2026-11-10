@@ -96,6 +96,9 @@ jobs:
           KOMZ_REASONING: 'low'
           KOMZ_BRAIN_INTERVAL: '90'
           KOMZ_RESEARCH_SECONDS: '900'
+          KOMZ_COUNCIL: '1'
+          KOMZ_COUNCIL_MODELS: '4'
+          KOMZ_COUNCIL_ROUNDS: '2'
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

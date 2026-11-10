@@ -19,15 +19,26 @@ import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
 
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
 DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
 TELEGRAM_API = "https://api.telegram.org/bot%s/%s"
 SUPABASE_BUCKET = os.environ.get("MT5_STORE_BUCKET") or "mt5-bridge"
+
+COUNCIL_ROLES = [
+    ("Momentum", "trend continuation, breakouts and orderflow alignment"),
+    ("Mean Reversion", "exhaustion, fade setups and value"),
+    ("Risk Guardian", "drawdown, exposure, spread, min-lot risk and correlation"),
+    ("Macro Scout", "news, session timing, liquidity and regime"),
+    ("Devil's Advocate", "find the strongest reason this trade fails"),
+    ("Portfolio Chair", "choose the best use of capital across candidates"),
+]
 
 NEWS_FEEDS = [
     ("FXStreet", "https://www.fxstreet.com/rss/news"),
@@ -251,6 +262,332 @@ class KomzMemory:
             }
 
 
+class KomzCouncil:
+    """A family of models that debate a candidate and hand a verdict to the chair."""
+
+    def __init__(self, brain) -> None:
+        self.brain = brain
+        self.enabled = os.environ.get("KOMZ_COUNCIL", "1") != "0"
+        self.max_models = max(1, min(6, int(os.environ.get("KOMZ_COUNCIL_MODELS", "4") or 4)))
+        self.rounds = max(1, min(3, int(os.environ.get("KOMZ_COUNCIL_ROUNDS", "2") or 2)))
+        self.models: List[Dict[str, Any]] = []
+        self._models_at = 0.0
+        self._lock = threading.Lock()
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self.running = False
+        self.last: Optional[Dict[str, Any]] = None
+        self.discoveries: List[Dict[str, Any]] = []
+
+    @staticmethod
+    def _short(model: str) -> str:
+        text = str(model or "model").split("/")[-1]
+        return text[:34]
+
+    def _discover(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            if self.models and time.time() - self._models_at < 3600:
+                return self.models
+        chosen: List[str] = []
+        try:
+            res = requests.get(
+                NVIDIA_MODELS_URL,
+                headers={"Authorization": "Bearer " + (self.brain.key or "")},
+                timeout=15,
+            )
+            if res.status_code < 400:
+                scored = []
+                for row in (res.json().get("data") or []):
+                    mid = str(row.get("id") or "")
+                    low = mid.lower()
+                    if not mid or mid in chosen:
+                        continue
+                    if any(x in low for x in ("embed", "rerank", "guard", "safety", "vision", "image", "video", "audio", "tts", "asr", "ocr", "parse")):
+                        continue
+                    score = 0
+                    if "instruct" in low or "chat" in low:
+                        score += 5
+                    if "nemotron" in low:
+                        score += 4
+                    if "llama" in low:
+                        score += 3
+                    if "qwen" in low:
+                        score += 2
+                    if "mistral" in low or "mixtral" in low:
+                        score += 2
+                    if "deepseek" in low:
+                        score += 2
+                    if score:
+                        scored.append((score, mid))
+                scored.sort(key=lambda x: (-x[0], x[1]))
+                chosen = [mid for _, mid in scored]
+        except Exception as e:
+            self.brain.log("komz council model discovery failed: %s" % _redact(e))
+        if self.brain.model and self.brain.model not in chosen:
+            chosen.insert(0, self.brain.model)
+        if not chosen:
+            chosen = [self.brain.model or DEFAULT_MODEL]
+        chosen = chosen[: self.max_models]
+        models = []
+        for index, mid in enumerate(chosen):
+            role, lens = COUNCIL_ROLES[index % len(COUNCIL_ROLES)]
+            models.append({"id": mid, "label": self._short(mid), "role": role, "lens": lens})
+        with self._lock:
+            self.models = models
+            self._models_at = time.time()
+        return models
+
+    def _member(self, model: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": model["id"],
+            "label": model["label"],
+            "role": model["role"],
+            "lens": model["lens"],
+            "ok": False,
+            "stance": None,
+            "confidence": 0.0,
+            "thesis": "",
+            "risk": "",
+            "discovery": "",
+            "latency": None,
+            "at": None,
+            "error": None,
+        }
+
+    def _notify(self, progress) -> None:
+        if not progress:
+            return
+        try:
+            progress()
+        except Exception:
+            pass
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            last = self.last or {}
+            models = [dict(m) for m in self.models]
+            members = [dict(m) for m in (last.get("members") or [])]
+            transcript = list(last.get("transcript") or [])[-12:]
+            discoveries = [dict(d) for d in self.discoveries[-8:]]
+        return {
+            "enabled": self.enabled,
+            "running": self.running,
+            "rounds": self.rounds,
+            "models": models,
+            "members": members,
+            "judge": dict(last.get("judge") or {}) if last.get("judge") else None,
+            "phase": last.get("phase"),
+            "summary": last.get("summary"),
+            "lastMeeting": last.get("finishedAt"),
+            "meetingId": last.get("meetingId"),
+            "transcript": transcript,
+            "discoveries": discoveries,
+        }
+
+    def _ask(self, member: Dict[str, Any], phase: str, context: str, candidate: Dict[str, Any], peers: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        role = member["role"]
+        lens = member["lens"]
+        system = (
+            "You are %s, one agent in Komz's trading family. Your lens: %s. "
+            "Be decisive and concrete. You judge the deterministic candidate; never invent a trade, "
+            "never change volume, never exceed the 2%% min-lot risk cap. "
+            "Return ONLY one strict JSON object." % (role, lens)
+        )
+        if phase == "round1":
+            user = (
+                "Independent take on this candidate. Look for a real edge, but do not demand perfection; "
+                "we want good trades, not zero trades. Say hold only when the setup is genuinely poor.\n"
+                + context
+                + '\nReturn JSON: {"stance":"buy|sell|hold","confidence":0.0,"thesis":"one sentence","risk":"one sentence","discovery":"one reusable observation"}'
+            )
+            max_tokens = 520
+        else:
+            family = "\n".join(
+                "- %s (%s): %s %.2f — %s" % (p.get("role"), p.get("label"), str(p.get("stance") or "hold").upper(), float(p.get("confidence") or 0), str(p.get("thesis") or "")[:180])
+                for p in (peers or [])
+            )
+            user = (
+                "Round 2 cross-examination. Read your family's takes, then revise only if their evidence changes your mind. "
+                "The chair wants the best available trade, not a perfect one.\n"
+                + context
+                + "\nYour round-1 take: %s %.2f — %s\nFamily:\n%s\n" % (
+                    str(member.get("stance") or "hold").upper(),
+                    float(member.get("confidence") or 0),
+                    str(member.get("thesis") or "")[:200],
+                    family,
+                )
+                + '\nReturn JSON: {"stance":"buy|sell|hold","confidence":0.0,"changed":false,"comment":"one sentence","discovery":"one reusable observation"}'
+            )
+            max_tokens = 380
+        started = time.time()
+        parsed = self.brain._json(system, user, max_tokens=max_tokens, reasoning="none", model=member["id"], timeout=32)
+        latency = round(time.time() - started, 2)
+        if not parsed:
+            return {"ok": False, "latency": latency, "error": "no JSON"}
+        stance = str(parsed.get("stance") or parsed.get("action") or "hold").lower()
+        if stance in ("long", "enter", "buy"):
+            stance = "buy"
+        elif stance in ("short", "sell"):
+            stance = "sell"
+        else:
+            stance = "hold"
+        return {
+            "ok": True,
+            "stance": stance,
+            "confidence": round(_clamp(parsed.get("confidence"), 0.0, 1.0, 0.45), 3),
+            "thesis": str(parsed.get("thesis") or parsed.get("comment") or "")[:280],
+            "risk": str(parsed.get("risk") or "")[:220],
+            "discovery": str(parsed.get("discovery") or "")[:220],
+            "latency": latency,
+            "error": None,
+        }
+
+    def review(self, account_id: str, cfg: Dict[str, Any], state: Dict[str, Any], candidate: Dict[str, Any], market: Dict[str, Any], info: Dict[str, Any], progress=None) -> Optional[Dict[str, Any]]:
+        if not self.enabled or not self.brain.available():
+            return None
+        sym = str(candidate.get("symbol") or "")
+        side = str(candidate.get("side") or "")
+        if not sym or side not in ("buy", "sell"):
+            return None
+        cache_key = "%s:%s:%d" % (sym, side, int(time.time() // 60))
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached and time.time() - cached.get("_at", 0) < 60:
+                return cached
+        models = self._discover()
+        meeting: Dict[str, Any] = {
+            "meetingId": "c%d" % int(time.time() * 1000),
+            "startedAt": _iso(),
+            "phase": "round1",
+            "candidate": {k: candidate.get(k) for k in ("symbol", "side", "confidence", "price", "spread", "atr", "regime", "summary")},
+            "members": [self._member(m) for m in models],
+            "judge": None,
+            "summary": "",
+            "transcript": [],
+            "discoveries": [],
+        }
+        self.running = True
+        with self._lock:
+            self.last = meeting
+        self._notify(progress)
+        context = self.brain._context(state, info, market, [candidate])
+        context["candidate"] = context["candidates"][0] if context.get("candidates") else {}
+        context_text = json.dumps(context, separators=(",", ":"))[:6800]
+        members = meeting["members"]
+        with ThreadPoolExecutor(max_workers=max(1, len(members))) as pool:
+            futures = {pool.submit(self._ask, m, "round1", context_text, candidate): m for m in members}
+            for fut in as_completed(futures):
+                member = futures[fut]
+                try:
+                    result = fut.result()
+                except Exception as e:
+                    result = {"ok": False, "error": _redact(e), "latency": None}
+                member.update(result)
+                member["at"] = _iso()
+                meeting["transcript"].append("%s [%s] %s %.2f — %s" % (
+                    member["role"], member["label"], str(member.get("stance") or "hold").upper(),
+                    float(member.get("confidence") or 0), member.get("thesis") or member.get("error") or "",
+                ))
+                if member.get("discovery"):
+                    meeting["discoveries"].append({"at": member["at"], "role": member["role"], "model": member["label"], "text": member["discovery"]})
+                self._notify(progress)
+        if self.rounds >= 2:
+            meeting["phase"] = "round2"
+            ok_members = [m for m in members if m.get("ok")]
+            peers = [{"role": m["role"], "label": m["label"], "stance": m.get("stance"), "confidence": m.get("confidence"), "thesis": m.get("thesis")} for m in ok_members]
+            if len(ok_members) >= 2:
+                with ThreadPoolExecutor(max_workers=max(1, len(ok_members))) as pool:
+                    futures = {pool.submit(self._ask, m, "round2", context_text, candidate, peers): m for m in ok_members}
+                    for fut in as_completed(futures):
+                        member = futures[fut]
+                        try:
+                            result = fut.result()
+                        except Exception as e:
+                            result = {"ok": False, "error": _redact(e), "latency": None}
+                        member.update(result)
+                        member["at"] = _iso()
+                        meeting["transcript"].append("%s revised %s %.2f — %s" % (
+                            member["role"], str(member.get("stance") or "hold").upper(),
+                            float(member.get("confidence") or 0), member.get("thesis") or "",
+                        ))
+                        if member.get("discovery"):
+                            meeting["discoveries"].append({"at": member["at"], "role": member["role"], "model": member["label"], "text": member["discovery"]})
+                        self._notify(progress)
+        meeting["phase"] = "judgement"
+        self._notify(progress)
+        ok_members = [m for m in members if m.get("ok")]
+        side_votes = [m for m in ok_members if m.get("stance") == side]
+        avg_conf = sum(float(m.get("confidence") or 0) for m in side_votes) / len(side_votes) if side_votes else 0.0
+        judge_model = self.brain.model if self.brain.model in [m["id"] for m in models] else (models[0]["id"] if models else self.brain.model)
+        family_text = "\n".join(
+            "- %s (%s): %s %.2f — %s | risk: %s" % (
+                m["role"], m["label"], str(m.get("stance") or "hold").upper(),
+                float(m.get("confidence") or 0), str(m.get("thesis") or "")[:220], str(m.get("risk") or "")[:140],
+            ) for m in ok_members
+        )
+        judge_system = (
+            "You are the Portfolio Chair of Komz's agent family. Decide whether the deterministic candidate is worth trading now. "
+            "Protect capital, but do not demand perfection: LO wants more good trades, recoveries and discoveries. "
+            "Approve when there is a coherent edge and no hard risk violation. Reject on genuine danger. "
+            "Return ONLY one strict JSON object."
+        )
+        judge_user = (
+            "Candidate and portfolio:\n" + context_text
+            + "\nFamily views:\n" + family_text
+            + '\nReturn JSON: {"decision":"approve|reject|wait","confidence":0.0,"reason":"one sentence","risk_note":"one sentence","size_multiplier":0.5,"discoveries":["..."]}'
+        )
+        judge = self.brain._json(judge_system, judge_user, max_tokens=900, reasoning="none", model=judge_model, timeout=32) or {}
+        decision_raw = str(judge.get("decision") or "").lower()
+        if decision_raw in ("approve", "buy", "sell", "enter", "long", "short"):
+            approve = True
+        elif decision_raw in ("reject", "no", "skip"):
+            approve = False
+        else:
+            approve = len(side_votes) >= max(1, len(ok_members) // 2 + 1) and avg_conf >= 0.45
+        risk_member = next((m for m in ok_members if "risk" in str(m.get("role") or "").lower()), None)
+        if risk_member and risk_member.get("stance") == "hold" and float(risk_member.get("confidence") or 0) >= 0.80:
+            approve = False
+        if not ok_members:
+            approve = False
+        confidence = _clamp(judge.get("confidence"), 0.0, 1.0, avg_conf or 0.45)
+        judge_out = {
+            "model": self._short(judge_model),
+            "decision": "approve" if approve else "reject",
+            "confidence": round(confidence, 3),
+            "reason": str(judge.get("reason") or ("%d/%d family members aligned with %s" % (len(side_votes), len(ok_members), side.upper())))[:300],
+            "riskNote": str(judge.get("risk_note") or (risk_member.get("risk") if risk_member else ""))[:240],
+            "sizeMultiplier": round(_clamp(judge.get("size_multiplier"), 0.25, 1.0, 1.0), 3),
+            "at": _iso(),
+        }
+        for text in (judge.get("discoveries") or [])[:4]:
+            if text:
+                meeting["discoveries"].append({"at": _iso(), "role": "Chair", "model": judge_out["model"], "text": str(text)[:220]})
+        meeting["judge"] = judge_out
+        meeting["summary"] = "%d/%d aligned · chair %s %.2f · %s" % (
+            len(side_votes), len(ok_members), judge_out["decision"], judge_out["confidence"], judge_out["reason"][:120])
+        meeting["finishedAt"] = _iso()
+        meeting["phase"] = "done"
+        with self._lock:
+            self.discoveries = (self.discoveries + meeting["discoveries"])[-40:]
+            self.last = meeting
+            self.running = False
+        self._notify(progress)
+        result = {
+            "action": "approve" if approve else "reject",
+            "confidence": round(confidence, 3),
+            "reason": judge_out["reason"],
+            "riskNote": judge_out["riskNote"],
+            "lesson": (meeting["discoveries"][-1]["text"] if meeting["discoveries"] else ""),
+            "council": meeting,
+            "at": _iso(),
+            "_at": time.time(),
+        }
+        with self._lock:
+            self._cache[cache_key] = result
+            if len(self._cache) > 60:
+                self._cache = dict(list(self._cache.items())[-40:])
+        return result
+
+
 class KomzBrain:
     def __init__(self, log, model: Optional[str] = None) -> None:
         self.log = log
@@ -261,6 +598,7 @@ class KomzBrain:
         self.research_interval = float(os.environ.get("KOMZ_RESEARCH_SECONDS", "900"))
         self.reasoning = os.environ.get("KOMZ_REASONING", "low")
         self.memory = KomzMemory(log)
+        self.council = KomzCouncil(self)
         self.last_call_at = 0.0
         self.last_error: Optional[str] = None
         self._review_cache: Dict[str, Dict[str, Any]] = {}
@@ -278,15 +616,16 @@ class KomzBrain:
             "lastCallAt": _iso(self.last_call_at) if self.last_call_at else None,
             "lastError": self.last_error,
             "memory": self.memory.status(),
+            "council": self.council.status(),
             "brainInterval": self.brain_interval,
             "researchInterval": self.research_interval,
         }
 
-    def _chat(self, system: str, user: str, max_tokens: int = 3000, temperature: float = 0.2, reasoning: Optional[str] = None) -> Optional[str]:
+    def _chat(self, system: str, user: str, max_tokens: int = 3000, temperature: float = 0.2, reasoning: Optional[str] = None, model: Optional[str] = None, timeout: float = 85) -> Optional[str]:
         if not self.available():
             return None
         payload = {
-            "model": self.model,
+            "model": model or self.model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -299,7 +638,7 @@ class KomzBrain:
         for attempt in (1, 2):
             try:
                 self.last_call_at = time.time()
-                res = requests.post(NVIDIA_URL, headers=headers, json=payload, timeout=85)
+                res = requests.post(NVIDIA_URL, headers=headers, json=payload, timeout=timeout)
                 if res.status_code == 429 and attempt == 1:
                     time.sleep(3)
                     continue
@@ -326,8 +665,8 @@ class KomzBrain:
                 time.sleep(1.5)
         return None
 
-    def _json(self, system: str, user: str, max_tokens: int = 3000, reasoning: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        content = self._chat(system, user, max_tokens=max_tokens, reasoning=reasoning)
+    def _json(self, system: str, user: str, max_tokens: int = 3000, reasoning: Optional[str] = None, model: Optional[str] = None, timeout: float = 85) -> Optional[Dict[str, Any]]:
+        content = self._chat(system, user, max_tokens=max_tokens, reasoning=reasoning, model=model, timeout=timeout)
         if not content:
             return None
         parsed = _extract_json(content)
@@ -409,6 +748,7 @@ class KomzBrain:
         candidate: Dict[str, Any],
         market: Dict[str, Any],
         info: Dict[str, Any],
+        progress=None,
     ) -> Optional[Dict[str, Any]]:
         if not self.available():
             return None
@@ -416,6 +756,15 @@ class KomzBrain:
         side = str(candidate.get("side") or "")
         if not sym or side not in ("buy", "sell"):
             return None
+        if self.council.enabled:
+            result = self.council.review(account_id, cfg, state, candidate, market, info, progress=progress)
+            if result:
+                cache_key = "%s:%s:%d" % (sym, side, int(time.time() // max(45, self.brain_interval)))
+                with self._lock:
+                    self._review_cache[cache_key] = result
+                    if len(self._review_cache) > 40:
+                        self._review_cache = dict(list(self._review_cache.items())[-30:])
+                return result
         cache_key = "%s:%s:%d" % (sym, side, int(time.time() // max(45, self.brain_interval)))
         with self._lock:
             cached = self._review_cache.get(cache_key)
