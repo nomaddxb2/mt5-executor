@@ -843,7 +843,7 @@ class KomzBrain:
         side = str(candidate.get("side") or "")
         if not sym or side not in ("buy", "sell"):
             return None
-        if self.council.enabled:
+        if self.council.enabled and not cfg.get("flipMode"):
             result = self.council.review(account_id, cfg, state, candidate, market, info, progress=progress)
             if result:
                 cache_key = "%s:%s:%d" % (sym, side, int(time.time() // max(45, self.brain_interval)))
@@ -852,16 +852,20 @@ class KomzBrain:
                     if len(self._review_cache) > 40:
                         self._review_cache = dict(list(self._review_cache.items())[-30:])
                 return result
-        cache_key = "%s:%s:%d" % (sym, side, int(time.time() // max(45, self.brain_interval)))
+        flip = bool(cfg.get("flipMode"))
+        ttl = 8 if flip else max(45, self.brain_interval)
+        cache_key = "%s:%s:%d" % (sym, side, int(time.time() // ttl))
         with self._lock:
             cached = self._review_cache.get(cache_key)
-            if cached and time.time() - cached.get("_at", 0) < max(60, self.brain_interval):
+            if cached and time.time() - cached.get("_at", 0) < (8 if flip else max(60, self.brain_interval)):
                 return cached
         context = self._context(state, info, market, [candidate])
+        context["rules"]["flipMode"] = flip
         context["candidate"] = context["candidates"][0] if context["candidates"] else {}
         user = (
             "Review this deterministic candidate. Approve only if the edge is coherent, spread/ATR is sane, "
-            "the portfolio is not overexposed, and recovery rules are respected. The engine already enforces the 2% cap; judge setup quality, not an inferred breach.\n"
+            "the portfolio is not overexposed, and recovery rules are respected. The engine already enforces the 2% cap; judge setup quality, not an inferred breach. "
+            + ("Flip mode: 1m candles, small TP, tight SL, 5s cooldown. Approve a coherent fast edge; reject only on hard risk, spread, or event danger.\n" if flip else "\n")
             + json.dumps(context, separators=(",", ":"))[:7000]
             + '\nReturn JSON: {"action":"approve|reject","confidence":0.0,"reason":"one sentence","risk_note":"one sentence","lesson":"optional one sentence"}'
         )
@@ -873,7 +877,7 @@ class KomzBrain:
         if action in ("reject", "hold", "no", "wait", "skip"):
             approve = False
         confidence = _clamp(parsed.get("confidence"), 0.0, 1.0, 0.5)
-        if confidence < 0.35:
+        if confidence < (0.30 if flip else 0.35):
             approve = False
         result = {
             "action": "approve" if approve else "reject",

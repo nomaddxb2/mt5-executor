@@ -241,9 +241,12 @@ def _digits(price: float) -> int:
 def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dict[str, Any],
                    weights: Dict[str, float], params: Dict[str, Any],
                    flow: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    m15 = [c for c in (tfs.get("M15") or []) if c]
+    primary = "M1" if params.get("flip") else "M15"
+    m15 = [c for c in (tfs.get(primary) or []) if c]
     if len(m15) < 60:
         m15 = [c for c in (tfs.get("M5") or []) if c]
+    if len(m15) < 60:
+        m15 = [c for c in (tfs.get("M15") or []) if c]
     if len(m15) < 60:
         return {
             "symbol": symbol, "ok": False, "side": None, "confidence": 0,
@@ -701,10 +704,32 @@ class AIAgent:
         params = dict(DEFAULT_PARAMS)
         params.update(state.get("params") or {})
         profile = str(cfg.get("mode") or "balanced").lower()
+        flip = bool(cfg.get("flipMode")) or profile == "flip"
+        if flip:
+            profile = "flip"
         aggressive = profile == "aggressive"
         for key in ("riskPct", "maxPositions", "minConfidence", "maxDailyLossPct"):
             if cfg.get(key) is not None:
                 params[key] = cfg[key]
+        if flip:
+            params["flip"] = True
+            params["minConfidence"] = min(float(params.get("minConfidence", 0.15)), 0.05)
+            params["threshold"] = min(float(params.get("threshold", 0.15)), 0.05)
+            params["riskPct"] = max(float(params.get("riskPct", 0.5)), 1.5)
+            params["maxPositions"] = min(int(params.get("maxPositions", 3)), 2)
+            params["cooldownSec"] = min(float(params.get("cooldownSec", 180)), 5)
+            params["maxDailyLossPct"] = min(float(params.get("maxDailyLossPct", 3)), 3.0)
+            params["timeStopHours"] = min(float(params.get("timeStopHours", 24)), 0.08)
+            params["maxSpreadAtr"] = min(float(params.get("maxSpreadAtr", 0.35)), 0.30)
+            params["atrSl"] = 0.7
+            params["atrTp"] = 0.7
+            params["trailAt"] = 0.35
+            params["trailDistance"] = 0.25
+        else:
+            params["flip"] = False
+            if (state.get("params") or {}).get("flip"):
+                for key in ("threshold", "minConfidence", "riskPct", "maxPositions", "maxDailyLossPct", "cooldownSec", "timeStopHours", "maxSpreadAtr", "atrSl", "atrTp", "trailAt", "trailDistance"):
+                    params[key] = DEFAULT_PARAMS[key]
         if aggressive:
             params["minConfidence"] = min(float(params.get("minConfidence", 0.15)), 0.08)
             params["threshold"] = min(float(params.get("threshold", 0.15)), 0.08)
@@ -715,7 +740,9 @@ class AIAgent:
         if cfg.get("minConfidence") is not None:
             params["threshold"] = min(float(params.get("threshold", 0.15)), float(params["minConfidence"]))
         state["profile"] = profile
+        state["flipMode"] = bool(flip)
         komz_state["profile"] = profile
+        komz_state["flipMode"] = bool(flip)
         weights = state.get("weights") or dict(DEFAULT_WEIGHTS)
         symbols = [str(s).upper() for s in (cfg.get("symbols") or [])][:6]
         focus = [str(s).upper() for s in (cfg.get("focusSymbols") or [])][:4]
@@ -763,7 +790,8 @@ class AIAgent:
             ai_positions = [p for p in all_positions if int(p.get("magic") or 0) == MAGIC]
             for sym in symbols:
                 tfs: Dict[str, List[Dict[str, Any]]] = {}
-                for tf in ("M5", "M15", "H1"):
+                tfs_list = ("M1", "M5", "M15", "H1") if flip else ("M5", "M15", "H1")
+                for tf in tfs_list:
                     try:
                         tfs[tf] = self.pool.rates(creds, sym, tf, 300)
                     except Exception:
@@ -965,11 +993,14 @@ class AIAgent:
             risk_mult = 0.5
         elif drawdown_pct >= 2.5:
             risk_mult = 0.75
+        if flip:
+            risk_mult = 1.0
         komz_state["recovery"] = {
             "active": risk_mult < 1.0,
             "drawdownPct": round(drawdown_pct, 2),
             "riskMultiplier": risk_mult,
             "peakEquity": round(peak, 2),
+            "flipOverride": bool(flip),
         }
         start_equity = float(state.get("startingEquity") or equity or 0)
         komz_state["compounding"] = {
@@ -1144,7 +1175,7 @@ class AIAgent:
         closed = state.get("closed") or []
         stats = compute_stats(closed, float(state.get("startingEquity") or equity))
         state["stats"] = stats
-        params, learn_note = adapt(params, stats, 0.08 if aggressive else 0.15)
+        params, learn_note = adapt(params, stats, 0.05 if flip else 0.08 if aggressive else 0.15)
         generation = int(stats.get("trades") or 0) // 20
         state["generation"] = generation
         state["params"] = params
