@@ -74,6 +74,23 @@ def _base(symbol: str) -> str:
     return s
 
 
+def update_flip_pair(fr: Dict[str, Any], seq: List[float], symbol: str, pnl: float) -> None:
+    base = _base(symbol)
+    pairs = fr.setdefault("pairs", {})
+    pair = pairs.setdefault(base, {"step": 0, "lot": seq[0], "deficit": 0.0, "missedProfit": float(fr.get("missedProfit") or 0.0)})
+    if pnl < 0:
+        pair["deficit"] = round(max(0.0, float(pair.get("deficit") or 0) + abs(pnl) + float(pair.get("missedProfit") or fr.get("missedProfit") or 0.0)), 2)
+        pair["step"] = min(int(pair.get("step") or 0) + 1, len(seq) - 1)
+    elif pnl > 0:
+        pair["step"] = 0
+        pair["deficit"] = 0.0
+    pair["lot"] = float(seq[int(pair.get("step") or 0)])
+    pairs[base] = pair
+    fr["lot"] = max(float(p.get("lot") or seq[0]) for p in pairs.values())
+    fr["step"] = max(int(p.get("step") or 0) for p in pairs.values())
+    fr["deficit"] = round(sum(float(p.get("deficit") or 0) for p in pairs.values()), 2)
+
+
 # ---------------------------------------------------------------- indicators
 def sma(values: List[float], period: int) -> List[float]:
     out: List[float] = []
@@ -600,6 +617,7 @@ def initial_state() -> Dict[str, Any]:
             "baseLot": 0.01, "maxLot": 0.08, "step": 0, "lot": 0.01,
             "deficit": 0.0, "missedProfit": 0.0,
             "sequence": [0.01, 0.02, 0.04, 0.08],
+            "pairs": {},
         },
         "komz": {
             "name": "Komz",
@@ -831,7 +849,7 @@ class AIAgent:
         fr = state.setdefault("flipRecovery", {
             "baseLot": 0.01, "maxLot": 0.08, "step": 0, "lot": 0.01,
             "deficit": 0.0, "missedProfit": 0.0,
-            "sequence": [0.01, 0.02, 0.04, 0.08],
+            "sequence": [0.01, 0.02, 0.04, 0.08], "pairs": {},
         })
         seq = [float(x) for x in (fr.get("sequence") or [0.01, 0.02, 0.04, 0.08])]
         if not seq:
@@ -839,11 +857,22 @@ class AIAgent:
         fr["sequence"] = seq
         fr["baseLot"] = float(fr.get("baseLot") or seq[0])
         fr["maxLot"] = float(fr.get("maxLot") or seq[-1])
-        fr["step"] = max(0, min(int(fr.get("step") or 0), len(seq) - 1))
-        fr["lot"] = float(seq[fr["step"]])
-        fr["missedProfit"] = round(max(0.5, equity * 0.001), 2)
-        if flip and not fr.get("deficit"):
+        if not isinstance(fr.get("pairs"), dict):
+            fr["pairs"] = {}
+            fr["legacyDeficit"] = round(float(fr.get("deficit") or 0), 2)
             fr["deficit"] = 0.0
+            fr["step"] = 0
+            fr["lot"] = float(seq[0])
+        missed = round(max(0.5, equity * 0.001), 2)
+        for key, pair in list(fr["pairs"].items()):
+            if not isinstance(pair, dict):
+                pair = {}
+            pair["step"] = max(0, min(int(pair.get("step") or 0), len(seq) - 1))
+            pair["lot"] = float(seq[pair["step"]])
+            pair["deficit"] = round(max(0.0, float(pair.get("deficit") or 0)), 2)
+            pair["missedProfit"] = missed
+            fr["pairs"][key] = pair
+        fr["missedProfit"] = missed
 
         rows = [analyze_symbol(sym, m["tfs"], m["quote"], weights, params, m.get("flow")) for sym, m in market.items()]
         rows.sort(key=lambda r: (0 if _base(r.get("symbol")) in focus_set else 1, -(float(r.get("confidence") or 0))))
@@ -897,15 +926,7 @@ class AIAgent:
             state["closed"].append(record)
             state["closed"] = state["closed"][-100:]
             if flip and old.get("flip", True):
-                pnl_rec = float(record.get("pnl") or 0)
-                if pnl_rec < 0:
-                    fr["deficit"] = round(max(0.0, float(fr.get("deficit") or 0) + abs(pnl_rec) + float(fr.get("missedProfit") or 0)), 2)
-                    fr["step"] = min(int(fr.get("step") or 0) + 1, len(seq) - 1)
-                elif pnl_rec > 0:
-                    fr["deficit"] = round(max(0.0, float(fr.get("deficit") or 0) - pnl_rec), 2)
-                    if fr["deficit"] <= 0:
-                        fr["step"] = 0
-                fr["lot"] = float(seq[int(fr.get("step") or 0)])
+                update_flip_pair(fr, seq, old.get("symbol"), float(record.get("pnl") or 0))
             for dec in reversed(state["decisions"]):
                 if str(dec.get("ticket")) == str(old.get("ticket")):
                     dec["outcome"] = "win" if pnl > 0 else "loss" if pnl < 0 else "flat"
@@ -959,6 +980,14 @@ class AIAgent:
             entry["riskAmount"] = old.get("riskAmount") or 1.0
             entry["decisionId"] = old.get("decisionId")
             entry["flip"] = bool(old.get("flip", flip))
+            entry["targetTp"] = old.get("targetTp") or pos.get("takeProfit") or 0
+            entry["tpArmed"] = bool(old.get("tpArmed"))
+            if not dry and flip and float(pos.get("takeProfit") or 0) > 0:
+                try:
+                    with self._locked():
+                        self.pool.modify_position(creds, {"ticket": pos.get("ticket"), "stopLoss": float(pos.get("stopLoss") or 0), "takeProfit": 0})
+                except Exception as e:
+                    state["error"] = "tp strip failed: %s" % e
 
             close_reason = ""
             age_h = 0.0
@@ -967,9 +996,9 @@ class AIAgent:
                 age_h = (datetime.now(timezone.utc) - opened).total_seconds() / 3600.0
             except Exception:
                 age_h = 0.0
-            if age_h >= float(params.get("timeStopHours", 24)):
+            if age_h >= float(params.get("timeStopHours", 24)) and not (flip and entry.get("tpArmed")):
                 close_reason = "Time stop: position open %.1fh" % age_h
-            elif row.get("side") and row.get("side") != side and float(row.get("confidence") or 0) >= max(0.45, float(params.get("threshold", 0.40))):
+            elif row.get("side") and row.get("side") != side and float(row.get("confidence") or 0) >= (max(0.20, float(params.get("threshold", 0.05))) if flip else max(0.45, float(params.get("threshold", 0.40)))):
                 close_reason = "Opposite signal: %s confidence %.2f" % (row.get("side").upper(), float(row.get("confidence") or 0))
             if close_reason and not dry:
                 with self._locked():
@@ -989,6 +1018,8 @@ class AIAgent:
                           "closedAt": _iso(), "reason": close_reason}
                 state["closed"].append(record)
                 state["closed"] = state["closed"][-100:]
+                if flip and entry.get("flip", True):
+                    update_flip_pair(fr, seq, pos.get("symbol"), pnl)
                 state["decisions"].append({
                     "id": "x%d" % int(time.time() * 1000), "at": _iso(), "action": "close",
                     "symbol": pos.get("symbol"), "side": side, "confidence": float(row.get("confidence") or 0),
@@ -999,17 +1030,42 @@ class AIAgent:
                 })
                 continue
 
+            # virtual TP: arm a protective trail when price reaches the target
+            target_tp = float(entry.get("targetTp") or 0)
+            if not dry and flip and atr_v > 0 and target_tp > 0 and not entry.get("tpArmed"):
+                hit = (side == "buy" and price >= target_tp) or (side == "sell" and price <= target_tp)
+                if hit:
+                    buffer = max(atr_v * 0.05, 0.0)
+                    armed_sl = target_tp - buffer if side == "buy" else target_tp + buffer
+                    cur_sl = float(pos.get("stopLoss") or 0)
+                    better = (side == "buy" and (cur_sl == 0 or armed_sl > cur_sl + 1e-9)) or (side == "sell" and (cur_sl == 0 or armed_sl < cur_sl - 1e-9))
+                    if better:
+                        try:
+                            with self._locked():
+                                self.pool.modify_position(creds, {"ticket": pos.get("ticket"), "stopLoss": round(armed_sl, _digits(price)), "takeProfit": 0})
+                            entry["sl"] = round(armed_sl, _digits(price))
+                            entry["tpArmed"] = True
+                            state["decisions"].append({
+                                "id": "a%d" % int(time.time() * 1000), "at": _iso(), "action": "arm",
+                                "symbol": pos.get("symbol"), "side": side, "confidence": float(row.get("confidence") or 0),
+                                "price": price, "volume": pos.get("volume"),
+                                "reason": "Target %.5f reached; TP withheld, SL moved to %.5f and trailing armed." % (target_tp, armed_sl),
+                                "ticket": pos.get("ticket"),
+                            })
+                        except Exception as e:
+                            state["error"] = "arm failed: %s" % e
+
             # trailing stop / break-even
             if not dry and atr_v > 0 and open_price > 0 and price > 0:
                 move = (price - open_price) if side == "buy" else (open_price - price)
                 cur_sl = float(pos.get("stopLoss") or 0)
-                if move >= float(params.get("trailAt", 1.2)) * atr_v:
+                if entry.get("tpArmed") or move >= float(params.get("trailAt", 1.2)) * atr_v:
                     new_sl = price - float(params.get("trailDistance", 1.2)) * atr_v if side == "buy" else price + float(params.get("trailDistance", 1.2)) * atr_v
                     better = (side == "buy" and (cur_sl == 0 or new_sl > cur_sl + 1e-9)) or (side == "sell" and (cur_sl == 0 or new_sl < cur_sl - 1e-9))
                     if better:
                         try:
                             with self._locked():
-                                self.pool.modify_position(creds, {"ticket": pos.get("ticket"), "stopLoss": round(new_sl, _digits(price)), "takeProfit": pos.get("takeProfit") or 0})
+                                self.pool.modify_position(creds, {"ticket": pos.get("ticket"), "stopLoss": round(new_sl, _digits(price)), "takeProfit": 0 if flip else (pos.get("takeProfit") or 0)})
                             entry["sl"] = round(new_sl, _digits(price))
                             state["decisions"].append({
                                 "id": "t%d" % int(time.time() * 1000), "at": _iso(), "action": "trail",
@@ -1069,6 +1125,7 @@ class AIAgent:
             "missedProfit": round(float(fr.get("missedProfit") or 0), 2),
             "targetProfit": round(float(fr.get("deficit") or 0) + float(fr.get("missedProfit") or 0), 2),
             "sequence": list(seq),
+            "pairs": {k: {"lot": float(v.get("lot") or 0.01), "step": int(v.get("step") or 0), "deficit": round(float(v.get("deficit") or 0), 2)} for k, v in (fr.get("pairs") or {}).items()},
         }
         start_equity = float(state.get("startingEquity") or equity or 0)
         komz_state["compounding"] = {
@@ -1119,7 +1176,10 @@ class AIAgent:
             sl_dist = abs(price - sl)
             lots = position_size(equity, risk_pct, sl_dist, spec)
             if flip:
-                step = max(0, min(int(fr.get("step") or 0), len(seq) - 1))
+                base_sym = _base(sym)
+                pairs = fr.setdefault("pairs", {})
+                pair = pairs.setdefault(base_sym, {"step": 0, "lot": seq[0], "deficit": 0.0, "missedProfit": float(fr.get("missedProfit") or 0.0)})
+                step = max(0, min(int(pair.get("step") or 0), len(seq) - 1))
                 lots = float(seq[step])
                 vmin = float(spec.get("volumeMin") or 0.01)
                 vstep = float(spec.get("volumeStep") or 0.01)
@@ -1130,8 +1190,9 @@ class AIAgent:
                 lots = min(lots, vmax)
                 atr_v = float(cand.get("atr") or 0)
                 base_tp_dist = max(0.7 * atr_v, abs(price - float(cand.get("tp") or price)))
-                deficit = float(fr.get("deficit") or 0)
-                target_usd = max(float(fr.get("missedProfit") or 0.0), deficit + float(fr.get("missedProfit") or 0.0))
+                deficit = float(pair.get("deficit") or 0)
+                missed = float(pair.get("missedProfit") or fr.get("missedProfit") or 0.0)
+                target_usd = max(missed, deficit + missed)
                 tick_value = float(spec.get("tickValue") or 1.0)
                 tick_size = float(spec.get("tickSize") or 0.00001)
                 usd_per_price = (tick_value / tick_size) * lots if tick_size else 0.0
@@ -1139,6 +1200,9 @@ class AIAgent:
                 max_tp = max(base_tp_dist, atr_v * 4.0)
                 tp_dist = max(base_tp_dist, min(target_dist, max_tp))
                 cand["tp"] = price + tp_dist if cand.get("side") == "buy" else price - tp_dist
+                pair["lot"] = lots
+                pair["missedProfit"] = missed
+                pairs[base_sym] = pair
             if lots <= 0:
                 continue
             tick_value = float(spec.get("tickValue") or 1.0)
@@ -1201,7 +1265,7 @@ class AIAgent:
                         "side": cand.get("side"),
                         "volume": lots,
                         "stopLoss": cand.get("sl"),
-                        "takeProfit": cand.get("tp"),
+                        "takeProfit": 0 if flip else cand.get("tp"),
                         "magic": MAGIC,
                         "comment": "ai-evolve",
                     })
@@ -1232,7 +1296,8 @@ class AIAgent:
             state["positions"].append({
                 "ticket": ticket, "symbol": sym, "side": cand.get("side"), "volume": lots,
                 "openPrice": fill, "currentPrice": fill, "profit": 0, "sl": cand.get("sl"),
-                "tp": cand.get("tp"), "openedAt": _iso(), "reason": decision["reason"],
+                "tp": None if flip else cand.get("tp"), "targetTp": cand.get("tp"), "tpArmed": False,
+                "openedAt": _iso(), "reason": decision["reason"],
                 "contributions": cand.get("contributions") or {}, "riskAmount": risk_amount,
                 "decisionId": decision["id"], "flip": bool(flip),
             })
