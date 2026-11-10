@@ -23,8 +23,8 @@ DEFAULT_PARAMS = {
     "atrTp": 3.2,
     "trailAt": 1.2,
     "trailDistance": 1.2,
-    "threshold": 0.30,
-    "minConfidence": 0.30,
+    "threshold": 0.15,
+    "minConfidence": 0.15,
     "riskPct": 0.5,
     "maxPositions": 3,
     "maxDailyLossPct": 3.0,
@@ -349,7 +349,7 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
     confidence = abs(score)
     side = "buy" if score > 0 else "sell" if score < 0 else None
 
-    threshold = max(float(params.get("threshold", 0.30)), float(params.get("minConfidence", 0.30)))
+    threshold = max(float(params.get("threshold", 0.15)), float(params.get("minConfidence", 0.15)))
     reasons: List[str] = []
     hold_reason = ""
 
@@ -511,7 +511,7 @@ def adapt(params: Dict[str, Any], stats: Dict[str, Any]) -> (Dict[str, Any], str
             p["threshold"] = min(0.70, float(p["threshold"]) + 0.01)
             note = "Win rate %.0f%% → raising confidence bar" % (wr * 100)
         elif wr > 0.60:
-            p["threshold"] = max(0.30, float(p["threshold"]) - 0.005)
+            p["threshold"] = max(0.15, float(p["threshold"]) - 0.005)
             note = "Win rate %.0f%% → easing confidence bar" % (wr * 100)
         if pf > 1.4:
             p["riskPct"] = min(1.5, float(p["riskPct"]) * 1.02)
@@ -520,7 +520,7 @@ def adapt(params: Dict[str, Any], stats: Dict[str, Any]) -> (Dict[str, Any], str
         if dd > 6:
             p["riskPct"] = max(0.1, float(p["riskPct"]) * 0.9)
             note = "Drawdown %.1f%% → cutting risk" % dd
-        p["threshold"] = round(_clamp(float(p["threshold"]), 0.30, 0.70), 4)
+        p["threshold"] = round(_clamp(float(p["threshold"]), 0.15, 0.70), 4)
         p["riskPct"] = round(_clamp(float(p["riskPct"]), 0.1, 1.5), 3)
     return p, note
 
@@ -702,7 +702,7 @@ class AIAgent:
             if cfg.get(key) is not None:
                 params[key] = cfg[key]
         if cfg.get("minConfidence") is not None:
-            params["threshold"] = min(float(params.get("threshold", 0.30)), float(params["minConfidence"]))
+            params["threshold"] = min(float(params.get("threshold", 0.15)), float(params["minConfidence"]))
         weights = state.get("weights") or dict(DEFAULT_WEIGHTS)
         symbols = [str(s).upper() for s in (cfg.get("symbols") or [])][:6]
         dry = bool(cfg.get("dryRun"))
