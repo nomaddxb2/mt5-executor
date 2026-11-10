@@ -326,7 +326,37 @@ class KomzCouncil:
             chosen.insert(0, self.brain.model)
         if not chosen:
             chosen = [self.brain.model or DEFAULT_MODEL]
-        chosen = chosen[: self.max_models]
+        candidates = chosen[:10]
+        working = []
+        for mid in candidates:
+            if mid == self.brain.model:
+                working.append(mid)
+        probes = [mid for mid in candidates if mid != self.brain.model]
+        if probes:
+            with ThreadPoolExecutor(max_workers=min(6, len(probes))) as pool:
+                futures = {
+                    pool.submit(
+                        self.brain._chat,
+                        "You are a model probe.",
+                        "Reply with OK.",
+                        max_tokens=8,
+                        temperature=0.0,
+                        reasoning="none",
+                        model=mid,
+                        timeout=12,
+                    ): mid for mid in probes
+                }
+                for fut in as_completed(futures):
+                    mid = futures[fut]
+                    try:
+                        if fut.result():
+                            working.append(mid)
+                    except Exception:
+                        continue
+        chosen = (working or [self.brain.model or DEFAULT_MODEL])[: self.max_models]
+        if chosen:
+            while len(chosen) < self.max_models:
+                chosen.append(chosen[0])
         models = []
         for index, mid in enumerate(chosen):
             role, lens = COUNCIL_ROLES[index % len(COUNCIL_ROLES)]
@@ -422,7 +452,7 @@ class KomzCouncil:
         parsed = self.brain._json(system, user, max_tokens=max_tokens, reasoning="none", model=member["id"], timeout=32)
         latency = round(time.time() - started, 2)
         if not parsed:
-            return {"ok": False, "latency": latency, "error": "no JSON"}
+            return {"ok": False, "latency": latency, "error": self.brain.last_error or "no JSON"}
         stance = str(parsed.get("stance") or parsed.get("action") or "hold").lower()
         if stance in ("long", "enter", "buy"):
             stance = "buy"
