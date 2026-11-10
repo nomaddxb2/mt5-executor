@@ -99,6 +99,8 @@ jobs:
           KOMZ_COUNCIL: '1'
           KOMZ_COUNCIL_MODELS: '4'
           KOMZ_COUNCIL_ROUNDS: '2'
+          KOMZ_COUNCIL_PROBE: '0'
+          KOMZ_NVIDIA_MIN_INTERVAL: '1.5'
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

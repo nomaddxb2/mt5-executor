@@ -326,14 +326,20 @@ class KomzCouncil:
             chosen.insert(0, self.brain.model)
         if not chosen:
             chosen = [self.brain.model or DEFAULT_MODEL]
-        candidates = chosen[:10]
-        working = []
-        for mid in candidates:
-            if mid == self.brain.model:
-                working.append(mid)
-        probes = [mid for mid in candidates if mid != self.brain.model]
+        probe_enabled = os.environ.get("KOMZ_COUNCIL_PROBE", "0") == "1"
+        if not probe_enabled:
+            chosen = [self.brain.model or DEFAULT_MODEL]
+            working = list(chosen)
+            probes = []
+        else:
+            candidates = chosen[:4]
+            working = []
+            for mid in candidates:
+                if mid == self.brain.model:
+                    working.append(mid)
+            probes = [mid for mid in candidates if mid != self.brain.model]
         if probes:
-            with ThreadPoolExecutor(max_workers=min(6, len(probes))) as pool:
+            with ThreadPoolExecutor(max_workers=min(2, len(probes))) as pool:
                 futures = {
                     pool.submit(
                         self.brain._chat,
@@ -633,6 +639,10 @@ class KomzBrain:
         self.last_error: Optional[str] = None
         self._review_cache: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._pace_lock = threading.Lock()
+        self._last_request_at = 0.0
+        self._cooldown_until = 0.0
+        self.min_interval = max(0.0, float(os.environ.get("KOMZ_NVIDIA_MIN_INTERVAL", "1.5")))
 
     def available(self) -> bool:
         return bool(self.enabled and self.key)
@@ -651,6 +661,17 @@ class KomzBrain:
             "researchInterval": self.research_interval,
         }
 
+    def _pace(self) -> None:
+        with self._pace_lock:
+            now = time.time()
+            wait = max(
+                self.min_interval - (now - self._last_request_at),
+                self._cooldown_until - now,
+            )
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request_at = time.time()
+
     def _chat(self, system: str, user: str, max_tokens: int = 3000, temperature: float = 0.2, reasoning: Optional[str] = None, model: Optional[str] = None, timeout: float = 85) -> Optional[str]:
         if not self.available():
             return None
@@ -665,13 +686,29 @@ class KomzBrain:
             "reasoning_effort": reasoning or self.reasoning,
         }
         headers = {"Authorization": "Bearer " + self.key, "Content-Type": "application/json"}
-        for attempt in (1, 2):
+        for attempt in range(3):
             try:
+                self._pace()
                 self.last_call_at = time.time()
                 res = requests.post(NVIDIA_URL, headers=headers, json=payload, timeout=timeout)
-                if res.status_code == 429 and attempt == 1:
-                    time.sleep(3)
-                    continue
+                if res.status_code == 429:
+                    retry = 0.0
+                    try:
+                        retry = float(res.headers.get("Retry-After") or 0)
+                    except Exception:
+                        pass
+                    if not retry:
+                        try:
+                            retry = float((res.json().get("parameters") or {}).get("retry_after") or 0)
+                        except Exception:
+                            pass
+                    delay = max(2.0, min(20.0, retry or (4.0 * (attempt + 1))))
+                    self._cooldown_until = max(self._cooldown_until, time.time() + delay)
+                    self.last_error = "nvidia 429: rate limited, backing off %.0fs" % delay
+                    self.log("komz brain: %s" % self.last_error)
+                    if attempt < 2:
+                        continue
+                    return None
                 if res.status_code >= 400:
                     self.last_error = "nvidia %s: %s" % (res.status_code, _redact(res.text[:200]))
                     self.log("komz brain: %s" % self.last_error)
@@ -682,7 +719,7 @@ class KomzBrain:
                 finish = choice.get("finish_reason")
                 if not content and finish == "length":
                     self.log("komz brain: length limit hit (max_tokens=%s, reasoning=%s)" % (payload["max_tokens"], (data.get("usage") or {}).get("completion_tokens_details")))
-                    if attempt == 1:
+                    if attempt == 0:
                         payload["max_tokens"] = min(4200, int(payload["max_tokens"]) + 900)
                         continue
                 self.last_error = None
@@ -692,7 +729,7 @@ class KomzBrain:
                 self.log("komz brain error: %s" % self.last_error)
                 if attempt == 2:
                     return None
-                time.sleep(1.5)
+                time.sleep(1.5 * (attempt + 1))
         return None
 
     def _json(self, system: str, user: str, max_tokens: int = 3000, reasoning: Optional[str] = None, model: Optional[str] = None, timeout: float = 85) -> Optional[Dict[str, Any]]:
