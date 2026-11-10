@@ -1024,6 +1024,11 @@ class AIAgent:
                         })
                         continue
                     cand["komzReview"] = review
+                    mult = max(0.25, min(1.0, float(review.get("sizeMultiplier") or 1.0)))
+                    if mult < 1.0:
+                        scaled = position_size(equity, risk_pct * mult, sl_dist, spec)
+                        if scaled > 0:
+                            lots = scaled
             if dry:
                 state["decisions"].append({
                     "id": "d%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
