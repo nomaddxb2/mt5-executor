@@ -220,7 +220,7 @@ class KomzMemory:
                     url,
                     headers={
                         "Authorization": "Bearer " + self.supabase_key,
-                        "Content-Type": "text/plain; charset=utf-8",
+                        "Content-Type": "application/json",
                         "x-upsert": "true",
                     },
                     data=part.encode("utf-8"),
