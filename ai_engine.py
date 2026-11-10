@@ -698,11 +698,22 @@ class AIAgent:
             self._post(account_id, state)
         params = dict(DEFAULT_PARAMS)
         params.update(state.get("params") or {})
+        profile = str(cfg.get("mode") or "balanced").lower()
+        aggressive = profile == "aggressive"
         for key in ("riskPct", "maxPositions", "minConfidence", "maxDailyLossPct"):
             if cfg.get(key) is not None:
                 params[key] = cfg[key]
+        if aggressive:
+            params["minConfidence"] = min(float(params.get("minConfidence", 0.15)), 0.08)
+            params["threshold"] = min(float(params.get("threshold", 0.15)), 0.08)
+            params["riskPct"] = max(float(params.get("riskPct", 0.5)), 1.0)
+            params["maxPositions"] = max(int(params.get("maxPositions", 3)), 5)
+            params["cooldownSec"] = min(float(params.get("cooldownSec", 180)), 60)
+            params["maxDailyLossPct"] = max(float(params.get("maxDailyLossPct", 3)), 4.0)
         if cfg.get("minConfidence") is not None:
             params["threshold"] = min(float(params.get("threshold", 0.15)), float(params["minConfidence"]))
+        state["profile"] = profile
+        komz_state["profile"] = profile
         weights = state.get("weights") or dict(DEFAULT_WEIGHTS)
         symbols = [str(s).upper() for s in (cfg.get("symbols") or [])][:6]
         dry = bool(cfg.get("dryRun"))
@@ -716,6 +727,8 @@ class AIAgent:
             state = initial_state()
             komz_state = state["komz"]
             state["mode"] = "dry-run" if dry else "live"
+            state["profile"] = profile
+            komz_state["profile"] = profile
             state["commandAck"] = "reset"
             state["thoughts"].append({"at": _iso(), "text": "Learning state reset by operator."})
             params = dict(DEFAULT_PARAMS)

@@ -560,11 +560,13 @@ class KomzCouncil:
                 float(m.get("confidence") or 0), str(m.get("thesis") or "")[:220], str(m.get("risk") or "")[:140],
             ) for m in ok_members
         )
+        aggressive = str(cfg.get("mode") or "balanced").lower() == "aggressive"
         judge_system = (
             "You are the Portfolio Chair of Komz's agent family. Decide whether the deterministic candidate is worth trading now. "
             "Protect capital, but do not demand perfection: LO wants more good trades, recoveries and discoveries. "
             "Approve when there is a coherent edge and no hard risk violation. Reject on genuine danger. "
-            "Return ONLY one strict JSON object."
+            + ("Aggressive mode is active: prefer a coherent trade over waiting for unanimity. Approve a strong deterministic edge with size_multiplier 0.5-0.75 even if the family is split; reject only on hard risk, event danger, or a strong Risk Guardian veto. " if aggressive else "")
+            + "Return ONLY one strict JSON object."
         )
         judge_user = (
             "Candidate and portfolio:\n" + context_text
@@ -578,7 +580,9 @@ class KomzCouncil:
         elif decision_raw in ("reject", "no", "skip"):
             approve = False
         else:
-            approve = len(side_votes) >= max(1, len(ok_members) // 2 + 1) and avg_conf >= 0.45
+            needed = 1 if aggressive else max(1, len(ok_members) // 2 + 1)
+            floor = 0.35 if aggressive else 0.45
+            approve = len(side_votes) >= needed and avg_conf >= floor
         risk_member = next((m for m in ok_members if "risk" in str(m.get("role") or "").lower()), None)
         if risk_member and risk_member.get("stance") == "hold" and float(risk_member.get("confidence") or 0) >= 0.80:
             approve = False
