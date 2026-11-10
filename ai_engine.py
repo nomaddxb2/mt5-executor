@@ -66,9 +66,11 @@ def _last(seq: List[float], default: float = 0.0) -> float:
 
 def _base(symbol: str) -> str:
     s = str(symbol or "").upper()
-    for suffix in (".RAW", ".M", ".Z", ".C", "M", "RAW", "Z"):
+    for suffix in (".CENT", "CENT", ".RAW", ".M", ".Z", ".C", "M", "RAW", "Z"):
         if s.endswith(suffix) and len(s) > len(suffix) + 2:
             return s[: -len(suffix)]
+    if s.endswith("C") and len(s) > 3 and s[:-1].endswith(("USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF", "XAU", "XAG", "BTC", "ETH")):
+        return s[:-1]
     return s
 
 
