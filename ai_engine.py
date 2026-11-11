@@ -1034,6 +1034,8 @@ class AIAgent:
             params["atrTp"] = 2.4
             params["trailAt"] = 1.0
             params["trailDistance"] = 0.8
+            if not state.get("profitModeStartAt"):
+                state["profitModeStartAt"] = _iso()
         if cfg.get("minConfidence") is not None and not profit:
             params["threshold"] = min(float(params.get("threshold", 0.15)), float(params["minConfidence"]))
         if flip:
@@ -1406,9 +1408,15 @@ class AIAgent:
         # daily loss guard
         today = datetime.now(timezone.utc).date().isoformat()
         today_pnl = sum(float(c.get("pnl") or 0) for c in state["closed"] if str(c.get("closedAt", ""))[:10] == today)
+        guard_pnl = today_pnl
+        if profit:
+            since = str(state.get("profitModeStartAt") or "")
+            if since:
+                guard_pnl = sum(float(c.get("pnl") or 0) for c in state["closed"] if str(c.get("closedAt", "")) >= since)
         state["todayPnl"] = round(today_pnl, 2)
+        state["guardPnl"] = round(guard_pnl, 2)
         loss_limit = -abs(equity * float(params.get("maxDailyLossPct", 3)) / 100.0)
-        halted = bool(equity and today_pnl <= loss_limit)
+        halted = bool(equity and guard_pnl <= loss_limit)
         if flip:
             halted = False
         state["halted"] = halted
@@ -1517,6 +1525,8 @@ class AIAgent:
             else:
                 break
         today_trades = sum(1 for c in (state.get("closed") or []) if str(c.get("closedAt", ""))[:10] == today)
+        if profit and state.get("profitModeStartAt"):
+            today_trades = sum(1 for c in (state.get("closed") or []) if str(c.get("closedAt", "")) >= str(state["profitModeStartAt"]))
         state["profitGuard"] = {
             "lossStreak": loss_streak, "todayTrades": today_trades,
             "maxTradesPerDay": 4, "maxLossStreak": 2,
