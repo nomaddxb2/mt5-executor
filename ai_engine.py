@@ -871,7 +871,8 @@ class AIAgent:
         params = dict(DEFAULT_PARAMS)
         params.update(state.get("params") or {})
         profile = str(cfg.get("mode") or "balanced").lower()
-        flip = bool(cfg.get("flipMode")) or profile == "flip"
+        profit = profile == "profit"
+        flip = (bool(cfg.get("flipMode")) or profile == "flip") and not profit
         if flip:
             profile = "flip"
         aggressive = profile == "aggressive"
@@ -904,15 +905,31 @@ class AIAgent:
             params["maxPositions"] = max(int(params.get("maxPositions", 3)), 5)
             params["cooldownSec"] = min(float(params.get("cooldownSec", 180)), 60)
             params["maxDailyLossPct"] = max(float(params.get("maxDailyLossPct", 3)), 4.0)
-        if cfg.get("minConfidence") is not None:
+        if profit:
+            params["flip"] = False
+            params["riskPct"] = min(float(cfg.get("riskPct") or 0.5), 0.5)
+            params["maxPositions"] = 2
+            params["minConfidence"] = max(float(cfg.get("minConfidence") or 0.55), 0.55)
+            params["threshold"] = max(float(params.get("threshold") or 0.55), 0.55)
+            params["maxDailyLossPct"] = min(float(cfg.get("maxDailyLossPct") or 2.0), 2.0)
+            params["cooldownSec"] = max(float(params.get("cooldownSec") or 300), 300)
+            params["timeStopHours"] = 4.0
+            params["maxSpreadAtr"] = 0.12
+            params["atrSl"] = 1.2
+            params["atrTp"] = 2.4
+            params["trailAt"] = 1.0
+            params["trailDistance"] = 0.8
+        if cfg.get("minConfidence") is not None and not profit:
             params["threshold"] = min(float(params.get("threshold", 0.15)), float(params["minConfidence"]))
         if flip:
             params["minConfidence"] = min(float(params.get("minConfidence") or 0.05), 0.05)
             params["threshold"] = min(float(params.get("threshold") or 0.05), 0.05)
         state["profile"] = profile
         state["flipMode"] = bool(flip)
+        state["profitMode"] = bool(profit)
         komz_state["profile"] = profile
         komz_state["flipMode"] = bool(flip)
+        komz_state["profitMode"] = bool(profit)
         weights = state.get("weights") or dict(DEFAULT_WEIGHTS)
         symbols = [str(s).upper() for s in (cfg.get("symbols") or [])][:6]
         focus = [str(s).upper() for s in (cfg.get("focusSymbols") or [])][:4]
@@ -1216,6 +1233,30 @@ class AIAgent:
                         except Exception as e:
                             state["error"] = "arm failed: %s" % e
 
+            # profit mode: protect the dollar gain at +1 ATR, then trail
+            if not dry and profit and atr_v > 0 and open_price > 0 and price > 0 and not entry.get("beMoved"):
+                move = (price - open_price) if side == "buy" else (open_price - price)
+                if move >= 1.0 * atr_v:
+                    spread = abs(float(row.get("ask") or 0) - float(row.get("bid") or 0))
+                    be_sl = open_price + max(spread * 2.0, atr_v * 0.05) if side == "buy" else open_price - max(spread * 2.0, atr_v * 0.05)
+                    cur_sl = float(pos.get("stopLoss") or 0)
+                    better = (side == "buy" and (cur_sl == 0 or be_sl > cur_sl + 1e-9)) or (side == "sell" and (cur_sl == 0 or be_sl < cur_sl - 1e-9))
+                    if better:
+                        try:
+                            with self._locked():
+                                self.pool.modify_position(creds, {"ticket": pos.get("ticket"), "stopLoss": round(be_sl, _digits(price)), "takeProfit": pos.get("takeProfit") or 0})
+                            entry["sl"] = round(be_sl, _digits(price))
+                            entry["beMoved"] = True
+                            state["decisions"].append({
+                                "id": "b%d" % int(time.time() * 1000), "at": _iso(), "action": "protect",
+                                "symbol": pos.get("symbol"), "side": side, "confidence": float(row.get("confidence") or 0),
+                                "price": price, "volume": pos.get("volume"),
+                                "reason": "Profit mode: +1 ATR confirmed; SL moved to %.5f to protect the gain." % be_sl,
+                                "ticket": pos.get("ticket"),
+                            })
+                        except Exception as e:
+                            state["error"] = "breakeven failed: %s" % e
+
             # trailing stop / break-even
             if not dry and atr_v > 0 and open_price > 0 and price > 0:
                 move = (price - open_price) if side == "buy" else (open_price - price)
@@ -1350,6 +1391,19 @@ class AIAgent:
         if int(state.get("cycle") or 0) % 20 == 0:
             state["thoughts"].append({"at": _iso(), "text": "Model jobs live: %s" % " · ".join("%s %s" % (j["role"], j["model"]) for j in jobs)})
         risk_pct = float(params.get("riskPct", 0.5)) * risk_mult
+
+        loss_streak = 0
+        for closed in reversed(state.get("closed") or []):
+            if float(closed.get("pnl") or 0) < 0:
+                loss_streak += 1
+            else:
+                break
+        today_trades = sum(1 for c in (state.get("closed") or []) if str(c.get("closedAt", ""))[:10] == today)
+        state["profitGuard"] = {
+            "lossStreak": loss_streak, "todayTrades": today_trades,
+            "maxTradesPerDay": 4, "maxLossStreak": 2,
+            "blocked": bool(profit and (loss_streak >= 2 or today_trades >= 4)),
+        }
 
         # open new positions
         open_count = len(state["positions"])
@@ -1532,6 +1586,23 @@ class AIAgent:
             last_at = float((state.get("lastTradeAt") or {}).get(sym) or 0)
             if now - last_at < float(params.get("cooldownSec", 180)):
                 continue
+            if profit:
+                if loss_streak >= 2 or today_trades >= 4:
+                    break
+                if float(cand.get("flowQuality") or 0) < 0.25:
+                    continue
+                if float(cand.get("flowAlignment") or 0) < 0:
+                    continue
+                atr_gate = float(cand.get("atr") or 0)
+                if atr_gate <= 0 or float(cand.get("spread") or 0) > float(params.get("maxSpreadAtr", 0.12)) * atr_gate:
+                    continue
+                if str(cand.get("regime") or "") not in ("trend", "volatile"):
+                    continue
+                if float(cand.get("adx") or 0) < 18:
+                    continue
+                board_bias = str((komz_state.get("factorBoard") or {}).get("bias") or "neutral")
+                if board_bias in ("buy", "sell") and board_bias != str(cand.get("side") or ""):
+                    continue
             spec = (market.get(sym) or {}).get("spec") or {}
             price = float(cand.get("ask") or cand.get("bid") or price)
             sl = float(cand.get("sl") or 0)
@@ -1733,6 +1804,33 @@ class AIAgent:
         state["aiPnl"] = round(realized + floating, 2)
         state["equity"] = round(equity, 2)
         state["balance"] = round(float(info.get("balance") or 0), 2)
+        confirmed = round(sum(float(c.get("pnl") or 0) for c in closed), 2)
+        additions = round(sum(max(0.0, float(c.get("pnl") or 0)) for c in closed), 2)
+        losses = round(sum(min(0.0, float(c.get("pnl") or 0)) for c in closed), 2)
+        curve = list(state.get("equityCurve") or [])
+        prev_equity = float(curve[-1].get("equity") or equity) if curve else equity
+        curve.append({"at": _iso(), "equity": round(equity, 2), "balance": round(float(info.get("balance") or 0), 2),
+                      "confirmedPnl": confirmed, "delta": round(equity - prev_equity, 2)})
+        state["equityCurve"] = curve[-240:]
+        state["confirmedProfit"] = confirmed
+        state["confirmedAdditions"] = additions
+        state["confirmedLosses"] = losses
+        ledger = []
+        running = 0.0
+        for c in closed[-50:]:
+            running += float(c.get("pnl") or 0)
+            ledger.append({"at": c.get("closedAt"), "symbol": c.get("symbol"), "side": c.get("side"),
+                           "pnl": round(float(c.get("pnl") or 0), 2), "cumulative": round(running, 2),
+                           "confirmed": True})
+        state["profitLedger"] = ledger
+        peak_now = float(state.get("peakEquity") or equity or 0)
+        state["recoveryStatus"] = {
+            "targetEquity": round(peak_now, 2), "equity": round(equity, 2),
+            "deficit": round(max(0.0, peak_now - equity), 2),
+            "recovered": bool(peak_now and equity >= peak_now and not state["positions"]),
+            "confirmedProfit": confirmed, "confirmedAdditions": additions, "confirmedLosses": losses,
+            "note": "Full recovery is confirmed only when equity >= peak and all positions are closed.",
+        }
         state["market"] = [
             {k: r.get(k) for k in ("symbol", "price", "bid", "ask", "spread", "rsi", "atr", "atrPct", "trend", "regime", "score", "confidence", "side", "holdReason", "flowAvailable", "flowScore", "flowAlignment", "flowPressure", "depthImbalance", "tickDeltaRatio", "bidDepth", "askDepth")}
             for r in rows if r.get("ok")
