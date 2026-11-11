@@ -282,6 +282,101 @@ def _digits(price: float) -> int:
 
 
 # ---------------------------------------------------------------- analysis
+def _closed(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [c for c in (candles or []) if c]
+
+
+def detect_patterns(m15: List[Dict[str, Any]], m5: List[Dict[str, Any]], atr_v: float,
+                    adx_v: float, ema_fast: List[float], ema_slow: List[float],
+                    rsi_v: float) -> List[Dict[str, Any]]:
+    bars = _closed(m15)
+    if len(bars) < 40 or atr_v <= 0:
+        return []
+    last = bars[-2]
+    o = float(last.get("open") or 0); h = float(last.get("high") or 0)
+    l = float(last.get("low") or 0); c = float(last.get("close") or 0)
+    body = abs(c - o)
+    rng = max(h - l, atr_v * 1e-6)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    look = 20
+    prior = bars[-look - 2:-2]
+    if len(prior) < 10:
+        return []
+    prior_high = max(float(x["high"]) for x in prior)
+    prior_low = min(float(x["low"]) for x in prior)
+    vols = [float(x.get("tickVolume") or 0) for x in bars[-21:-1]]
+    avg_vol = sum(vols) / len(vols) if vols else 0.0
+    last_vol = float(last.get("tickVolume") or 0)
+    vol_ratio = (last_vol / avg_vol) if avg_vol > 0 else 1.0
+    trend_up = len(ema_fast) > 1 and len(ema_slow) > 1 and ema_fast[-1] > ema_slow[-1]
+    trend_down = len(ema_fast) > 1 and len(ema_slow) > 1 and ema_fast[-1] < ema_slow[-1]
+    patterns: List[Dict[str, Any]] = []
+
+    if h > prior_high and c < prior_high and upper_wick >= atr_v * 0.20:
+        score = _clamp(0.45 + upper_wick / atr_v * 0.25 + body / atr_v * 0.10 + (0.08 if trend_down else 0.0), 0.0, 1.0)
+        patterns.append({"name": "liquidity_sweep", "side": "sell", "score": round(score, 3),
+                         "reason": "Swept 20-bar high %.5f and closed back below it (wick %.2f ATR)." % (prior_high, upper_wick / atr_v)})
+    if l < prior_low and c > prior_low and lower_wick >= atr_v * 0.20:
+        score = _clamp(0.45 + lower_wick / atr_v * 0.25 + body / atr_v * 0.10 + (0.08 if trend_up else 0.0), 0.0, 1.0)
+        patterns.append({"name": "liquidity_sweep", "side": "buy", "score": round(score, 3),
+                         "reason": "Swept 20-bar low %.5f and closed back above it (wick %.2f ATR)." % (prior_low, lower_wick / atr_v)})
+
+    if c > prior_high and trend_up and adx_v >= 18 and vol_ratio >= 1.05:
+        score = _clamp(0.45 + (c - prior_high) / atr_v * 0.30 + min(0.15, (vol_ratio - 1.0) * 0.15), 0.0, 1.0)
+        patterns.append({"name": "trend_breakout", "side": "buy", "score": round(score, 3),
+                         "reason": "Closed above 20-bar high %.5f with ADX %.1f and volume %.2fx." % (prior_high, adx_v, vol_ratio)})
+    if c < prior_low and trend_down and adx_v >= 18 and vol_ratio >= 1.05:
+        score = _clamp(0.45 + (prior_low - c) / atr_v * 0.30 + min(0.15, (vol_ratio - 1.0) * 0.15), 0.0, 1.0)
+        patterns.append({"name": "trend_breakout", "side": "sell", "score": round(score, 3),
+                         "reason": "Closed below 20-bar low %.5f with ADX %.1f and volume %.2fx." % (prior_low, adx_v, vol_ratio)})
+
+    if trend_up and l <= ema_fast[-1] + atr_v * 0.20 and c > ema_fast[-1] and c > o:
+        score = _clamp(0.42 + (c - ema_fast[-1]) / atr_v * 0.20 + (0.10 if vol_ratio >= 1.0 else 0.0), 0.0, 1.0)
+        patterns.append({"name": "trend_pullback", "side": "buy", "score": round(score, 3),
+                         "reason": "Pulled into EMA20 %.5f and closed bullish above it." % ema_fast[-1]})
+    if trend_down and h >= ema_fast[-1] - atr_v * 0.20 and c < ema_fast[-1] and c < o:
+        score = _clamp(0.42 + (ema_fast[-1] - c) / atr_v * 0.20 + (0.10 if vol_ratio >= 1.0 else 0.0), 0.0, 1.0)
+        patterns.append({"name": "trend_pullback", "side": "sell", "score": round(score, 3),
+                         "reason": "Pulled into EMA20 %.5f and closed bearish below it." % ema_fast[-1]})
+
+    try:
+        hour = datetime.fromisoformat(str(last.get("time") or "").replace("Z", "+00:00")).hour
+    except Exception:
+        hour = -1
+    session = (7 <= hour <= 11) or (12 <= hour <= 16)
+    if session and len(bars) >= 12:
+        opening = bars[-10:-2]
+        opening_high = max(float(x["high"]) for x in opening)
+        opening_low = min(float(x["low"]) for x in opening)
+        if c > opening_high and trend_up and vol_ratio >= 1.05:
+            score = _clamp(0.45 + (c - opening_high) / atr_v * 0.25 + min(0.12, (vol_ratio - 1.0) * 0.12), 0.0, 1.0)
+            patterns.append({"name": "session_breakout", "side": "buy", "score": round(score, 3),
+                             "reason": "London/NY session break above 8-bar range %.5f with volume %.2fx." % (opening_high, vol_ratio)})
+        if c < opening_low and trend_down and vol_ratio >= 1.05:
+            score = _clamp(0.45 + (opening_low - c) / atr_v * 0.25 + min(0.12, (vol_ratio - 1.0) * 0.12), 0.0, 1.0)
+            patterns.append({"name": "session_breakout", "side": "sell", "score": round(score, 3),
+                             "reason": "London/NY session break below 8-bar range %.5f with volume %.2fx." % (opening_low, vol_ratio)})
+
+    if body >= atr_v * 1.15 and vol_ratio >= 1.45:
+        side_m = "buy" if c > o else "sell"
+        score = _clamp(0.50 + min(0.25, (body / atr_v - 1.15) * 0.20) + min(0.12, (vol_ratio - 1.45) * 0.10), 0.0, 1.0)
+        patterns.append({"name": "momentum_ignition", "side": side_m, "score": round(score, 3),
+                         "reason": "Displacement candle %.2f ATR on %.2fx volume." % (body / atr_v, vol_ratio)})
+
+    if adx_v < 20:
+        if rsi_v >= 65 and c > ema_fast[-1]:
+            score = _clamp(0.35 + (rsi_v - 65) / 35.0 + (0.10 if vol_ratio < 1.0 else 0.0), 0.0, 1.0)
+            patterns.append({"name": "range_fade", "side": "sell", "score": round(score, 3),
+                             "reason": "Range regime: RSI %.1f stretched above EMA20." % rsi_v})
+        elif rsi_v <= 35 and c < ema_fast[-1]:
+            score = _clamp(0.35 + (35 - rsi_v) / 35.0 + (0.10 if vol_ratio < 1.0 else 0.0), 0.0, 1.0)
+            patterns.append({"name": "range_fade", "side": "buy", "score": round(score, 3),
+                             "reason": "Range regime: RSI %.1f stretched below EMA20." % rsi_v})
+
+    return patterns
+
+
 def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dict[str, Any],
                    weights: Dict[str, float], params: Dict[str, Any],
                    flow: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -395,6 +490,11 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
         score += c
     confidence = abs(score)
     side = "buy" if score > 0 else "sell" if score < 0 else None
+    patterns = detect_patterns(m15, tfs.get("M5") or [], atr_v, adx_v, ema_fast, ema_slow, rsi_v)
+    aligned = [p for p in patterns if side and p.get("side") == side]
+    pattern_score = max([float(p.get("score") or 0) for p in aligned] or [0.0])
+    if side and pattern_score:
+        confidence = _clamp(confidence + pattern_score * 0.12, 0.0, 1.0)
 
     threshold = max(float(params.get("threshold", 0.15)), float(params.get("minConfidence", 0.15)))
     reasons: List[str] = []
@@ -411,6 +511,10 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
     else:
         reasons.append("Inside 20-bar range %.5f–%.5f" % (lo, hi))
     reasons.append("Regime %s · ATR %.5f (%.2f%%) · BB z %.2f" % (regime, atr_v, atr_pct * 100, z))
+    if aligned:
+        reasons.append("Pattern %s %.2f: %s" % (aligned[0].get("name"), pattern_score, aligned[0].get("reason")))
+    elif patterns:
+        reasons.append("Pattern conflict: %s" % ", ".join("%s %s" % (p.get("name"), p.get("side")) for p in patterns[:2]))
 
     if not side or confidence < threshold:
         hold_reason = "Confidence %.2f below threshold %.2f" % (confidence, threshold)
@@ -506,6 +610,9 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
         "bidDepth": flow.get("bidDepth"),
         "askDepth": flow.get("askDepth"),
         "flowNotes": flow.get("notes") or [],
+        "patterns": patterns,
+        "patternScore": round(pattern_score, 3),
+        "patternName": aligned[0].get("name") if aligned else None,
     }
 
 
@@ -559,6 +666,13 @@ def build_factor_board(rows: List[Dict[str, Any]], equity: float, drawdown_pct: 
             elif key == "meanrev":
                 detail = "BB z %+.2f" % float(row.get("bbZ") or 0)
             add(key, label, direction * strength, float(weights.get(key) or 0), state, detail, source)
+        p_side = str(row.get("side") or "")
+        p_score = float(row.get("patternScore") or 0.0)
+        p_signed = p_score if p_side == "buy" else -p_score if p_side == "sell" else 0.0
+        add("patterns", "Patterns", p_signed, 0.15,
+            str(row.get("patternName") or "none"),
+            "best aligned pattern %.2f · %s" % (p_score, row.get("patternName") or "none"),
+            "M15 structure")
         add("execution", "Execution", -_clamp(spread_atr / 0.35, 0.0, 1.0), 0.0,
             "tight" if spread_atr <= 0.10 else "wide",
             "spread %.5f · %.2f%% of ATR" % (spread, spread_atr * 100.0), "quote")
@@ -907,6 +1021,7 @@ class AIAgent:
             params["maxDailyLossPct"] = max(float(params.get("maxDailyLossPct", 3)), 4.0)
         if profit:
             params["flip"] = False
+            params["profit"] = True
             params["riskPct"] = min(float(cfg.get("riskPct") or 0.5), 0.5)
             params["maxPositions"] = 2
             params["minConfidence"] = max(float(cfg.get("minConfidence") or 0.55), 0.55)
@@ -1080,6 +1195,8 @@ class AIAgent:
                 "r": round(reward, 3),
                 "closedAt": _iso(),
                 "reason": old.get("reason"),
+                "pattern": old.get("pattern"),
+                "patternScore": old.get("patternScore"),
                 "flip": bool(old.get("flip", flip)),
             }
             closed_now.append(record)
@@ -1176,7 +1293,8 @@ class AIAgent:
                 record = {"ticket": pos.get("ticket"), "symbol": pos.get("symbol"), "side": side,
                           "volume": pos.get("volume"), "openPrice": open_price,
                           "closePrice": price, "pnl": round(pnl, 2), "r": round(reward, 3),
-                          "closedAt": _iso(), "reason": close_reason}
+                          "closedAt": _iso(), "reason": close_reason,
+                          "pattern": entry.get("pattern"), "patternScore": entry.get("patternScore")}
                 state["closed"].append(record)
                 state["closed"] = state["closed"][-100:]
                 if flip and entry.get("flip", True):
@@ -1593,6 +1711,8 @@ class AIAgent:
                     continue
                 if float(cand.get("flowAlignment") or 0) < 0:
                     continue
+                if float(cand.get("patternScore") or 0) < 0.25:
+                    continue
                 atr_gate = float(cand.get("atr") or 0)
                 if atr_gate <= 0 or float(cand.get("spread") or 0) > float(params.get("maxSpreadAtr", 0.12)) * atr_gate:
                     continue
@@ -1741,6 +1861,7 @@ class AIAgent:
                 "openedAt": _iso(), "reason": decision["reason"],
                 "contributions": cand.get("contributions") or {}, "riskAmount": risk_amount,
                 "decisionId": decision["id"], "flip": bool(flip),
+                "pattern": cand.get("patternName"), "patternScore": cand.get("patternScore"),
             })
             state.setdefault("lastTradeAt", {})[sym] = now
             open_count += 1
@@ -1783,6 +1904,21 @@ class AIAgent:
         closed = state.get("closed") or []
         stats = compute_stats(closed, float(state.get("startingEquity") or equity))
         state["stats"] = stats
+        pattern_stats: Dict[str, Dict[str, Any]] = {}
+        for c in closed:
+            name = str(c.get("pattern") or "unclassified")
+            bucket = pattern_stats.setdefault(name, {"trades": 0, "wins": 0, "pnl": 0.0, "r": 0.0})
+            bucket["trades"] += 1
+            pnl_c = float(c.get("pnl") or 0)
+            bucket["pnl"] += pnl_c
+            bucket["r"] += float(c.get("r") or 0)
+            if pnl_c > 0:
+                bucket["wins"] += 1
+        for bucket in pattern_stats.values():
+            bucket["winRate"] = round(bucket["wins"] / bucket["trades"], 3) if bucket["trades"] else 0.0
+            bucket["pnl"] = round(bucket["pnl"], 2)
+            bucket["avgR"] = round(bucket["r"] / bucket["trades"], 3) if bucket["trades"] else 0.0
+        state["patternStats"] = pattern_stats
         params, learn_note = adapt(params, stats, 0.55 if profit else 0.05 if flip else 0.08 if aggressive else 0.15)
         if profit:
             params["riskPct"] = min(float(params.get("riskPct") or 0.5), 0.5)
@@ -1838,7 +1974,7 @@ class AIAgent:
             "note": "Full recovery is confirmed only when equity >= peak and all positions are closed.",
         }
         state["market"] = [
-            {k: r.get(k) for k in ("symbol", "price", "bid", "ask", "spread", "rsi", "atr", "atrPct", "trend", "regime", "score", "confidence", "side", "holdReason", "flowAvailable", "flowScore", "flowAlignment", "flowPressure", "depthImbalance", "tickDeltaRatio", "bidDepth", "askDepth")}
+            {k: r.get(k) for k in ("symbol", "price", "bid", "ask", "spread", "rsi", "atr", "atrPct", "trend", "regime", "score", "confidence", "side", "holdReason", "flowAvailable", "flowScore", "flowAlignment", "flowPressure", "depthImbalance", "tickDeltaRatio", "bidDepth", "askDepth", "patterns", "patternScore", "patternName")}
             for r in rows if r.get("ok")
         ]
         if top and top.get("ok"):
