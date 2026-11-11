@@ -420,6 +420,9 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
     trend_strength = _clamp(abs(diff) / (atr_v * 0.8), 0.0, 1.0) * (0.55 + 0.45 * _clamp(adx_v / 40.0, 0.0, 1.0))
     h1 = [c for c in (tfs.get("H1") or []) if c]
     h1_note = ""
+    h1_patterns: List[Dict[str, Any]] = []
+    h1_atr = 0.0
+    h1_adx = 0.0
     if len(h1) >= 50:
         h1c = [float(c["close"]) for c in h1]
         h1f = ema(h1c, 20)[-1]
@@ -430,6 +433,18 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
         else:
             trend_strength *= 0.75
             h1_note = "H1 bias diverges"
+    if len(h1) >= 60:
+        h1h = [float(c["high"]) for c in h1]
+        h1l = [float(c["low"]) for c in h1]
+        h1_atr = max(_last(atr(h1h, h1l, h1c, 14), h1c[-1] * 0.001), h1c[-1] * 1e-6)
+        h1_adx = _last(adx(h1h, h1l, h1c, 14), 0.0)
+        h1_patterns = detect_patterns(h1, [], h1_atr, h1_adx, ema(h1c, 20), ema(h1c, 50), _last(rsi(h1c, 14), 50.0))
+        for p in h1_patterns:
+            p["timeframe"] = "H1"
+            p["basePattern"] = p.get("name")
+            if p.get("name") == "session_breakout":
+                p["name"] = "h1_session_breakout"
+                p["validated"] = True
 
     mom_dir = 1 if hist_v > 0 else -1 if hist_v < 0 else 0
     mom_strength = _clamp(abs(hist_v) / (atr_v * 0.12), 0.0, 1.0)
@@ -491,10 +506,22 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
     confidence = abs(score)
     side = "buy" if score > 0 else "sell" if score < 0 else None
     patterns = detect_patterns(m15, tfs.get("M5") or [], atr_v, adx_v, ema_fast, ema_slow, rsi_v)
-    aligned = [p for p in patterns if side and p.get("side") == side]
+    h1_best = None
+    if params.get("profit"):
+        h1_best = max((p for p in h1_patterns if p.get("name") == "h1_session_breakout" and float(p.get("score") or 0) >= 0.60), key=lambda p: float(p.get("score") or 0), default=None)
+    if h1_best:
+        side = str(h1_best.get("side") or "")
+        confidence = max(confidence, 0.72)
+    combined = h1_patterns + patterns
+    aligned = [p for p in combined if side and p.get("side") == side]
+    if h1_best:
+        aligned = [h1_best] + [p for p in aligned if p is not h1_best]
     pattern_score = max([float(p.get("score") or 0) for p in aligned] or [0.0])
-    if side and pattern_score:
+    if side and pattern_score and not h1_best:
         confidence = _clamp(confidence + pattern_score * 0.12, 0.0, 1.0)
+    risk_atr = h1_atr if h1_best else atr_v
+    sl_mult = 1.0 if h1_best else float(params.get("atrSl", 1.8))
+    tp_mult = 1.0 if h1_best else float(params.get("atrTp", 3.2))
 
     threshold = max(float(params.get("threshold", 0.15)), float(params.get("minConfidence", 0.15)))
     reasons: List[str] = []
@@ -549,18 +576,18 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
     digits = _digits(price)
     sl = tp = None
     if side:
-        sl_dist = atr_v * float(params.get("atrSl", 1.8))
-        tp_dist = atr_v * float(params.get("atrTp", 3.2))
+        sl_dist = risk_atr * sl_mult
+        tp_dist = risk_atr * tp_mult
         if side == "buy":
             sl = round(ask - sl_dist, digits)
             tp = round(ask + tp_dist, digits)
-            reasons.append("Risk %.1f%% · SL %.5f (%.1f×ATR) · TP %.5f (%.1f×ATR)" % (
-                float(params.get("riskPct", 0.5)), sl, float(params.get("atrSl", 1.8)), tp, float(params.get("atrTp", 3.2))))
+            reasons.append("Risk %.1f%% · SL %.5f (%.1f×%sATR) · TP %.5f (%.1f×%sATR)" % (
+                float(params.get("riskPct", 0.5)), sl, sl_mult, "H1 " if h1_best else "", tp, tp_mult, "H1 " if h1_best else ""))
         else:
             sl = round(bid + sl_dist, digits)
             tp = round(bid - tp_dist, digits)
-            reasons.append("Risk %.1f%% · SL %.5f (%.1f×ATR) · TP %.5f (%.1f×ATR)" % (
-                float(params.get("riskPct", 0.5)), sl, float(params.get("atrSl", 1.8)), tp, float(params.get("atrTp", 3.2))))
+            reasons.append("Risk %.1f%% · SL %.5f (%.1f×%sATR) · TP %.5f (%.1f×%sATR)" % (
+                float(params.get("riskPct", 0.5)), sl, sl_mult, "H1 " if h1_best else "", tp, tp_mult, "H1 " if h1_best else ""))
         reasons.append("Confidence %.2f ≥ %.2f" % (confidence, threshold))
 
     summary = ""
@@ -610,9 +637,17 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
         "bidDepth": flow.get("bidDepth"),
         "askDepth": flow.get("askDepth"),
         "flowNotes": flow.get("notes") or [],
-        "patterns": patterns,
+        "patterns": combined,
+        "h1Patterns": h1_patterns,
         "patternScore": round(pattern_score, 3),
         "patternName": aligned[0].get("name") if aligned else None,
+        "validatedPattern": bool(h1_best),
+        "timeframe": "H1" if h1_best else "M15",
+        "riskAtr": round(risk_atr, digits),
+        "h1Adx": round(h1_adx, 2),
+        "slMult": round(sl_mult, 2),
+        "tpMult": round(tp_mult, 2),
+        "timeStopHours": 24.0 if h1_best else None,
     }
 
 
@@ -1261,6 +1296,10 @@ class AIAgent:
             entry["flip"] = bool(old.get("flip", flip))
             entry["targetTp"] = old.get("targetTp") or pos.get("takeProfit") or 0
             entry["tpArmed"] = bool(old.get("tpArmed"))
+            entry["timeStopHours"] = old.get("timeStopHours") or pos.get("timeStopHours")
+            entry["riskAtr"] = old.get("riskAtr")
+            entry["timeframe"] = old.get("timeframe")
+            entry["beMoved"] = bool(old.get("beMoved"))
             if not dry and flip and float(pos.get("takeProfit") or 0) > 0:
                 try:
                     with self._locked():
@@ -1276,7 +1315,7 @@ class AIAgent:
                 age_h = (datetime.now(timezone.utc) - opened).total_seconds() / 3600.0
             except Exception:
                 age_h = 0.0
-            if age_h >= float(params.get("timeStopHours", 24)) and not (flip and entry.get("tpArmed")) and not hedge_leg:
+            if age_h >= float(entry.get("timeStopHours") or params.get("timeStopHours", 24)) and not (flip and entry.get("tpArmed")) and not hedge_leg:
                 close_reason = "Time stop: position open %.1fh" % age_h
             elif not hedge_leg and row.get("side") and row.get("side") != side and float(row.get("confidence") or 0) >= (max(0.20, float(params.get("threshold", 0.05))) if flip else max(0.45, float(params.get("threshold", 0.40)))):
                 close_reason = "Opposite signal: %s confidence %.2f" % (row.get("side").upper(), float(row.get("confidence") or 0))
@@ -1354,11 +1393,12 @@ class AIAgent:
                             state["error"] = "arm failed: %s" % e
 
             # profit mode: protect the dollar gain at +1 ATR, then trail
-            if not dry and profit and atr_v > 0 and open_price > 0 and price > 0 and not entry.get("beMoved"):
+            pos_atr = float(entry.get("riskAtr") or atr_v or 0)
+            if not dry and profit and pos_atr > 0 and open_price > 0 and price > 0 and not entry.get("beMoved"):
                 move = (price - open_price) if side == "buy" else (open_price - price)
-                if move >= 1.0 * atr_v:
+                if move >= 1.0 * pos_atr:
                     spread = abs(float(row.get("ask") or 0) - float(row.get("bid") or 0))
-                    be_sl = open_price + max(spread * 2.0, atr_v * 0.05) if side == "buy" else open_price - max(spread * 2.0, atr_v * 0.05)
+                    be_sl = open_price + max(spread * 2.0, pos_atr * 0.05) if side == "buy" else open_price - max(spread * 2.0, pos_atr * 0.05)
                     cur_sl = float(pos.get("stopLoss") or 0)
                     better = (side == "buy" and (cur_sl == 0 or be_sl > cur_sl + 1e-9)) or (side == "sell" and (cur_sl == 0 or be_sl < cur_sl - 1e-9))
                     if better:
@@ -1378,11 +1418,11 @@ class AIAgent:
                             state["error"] = "breakeven failed: %s" % e
 
             # trailing stop / break-even
-            if not dry and atr_v > 0 and open_price > 0 and price > 0:
+            if not dry and pos_atr > 0 and open_price > 0 and price > 0:
                 move = (price - open_price) if side == "buy" else (open_price - price)
                 cur_sl = float(pos.get("stopLoss") or 0)
-                if entry.get("tpArmed") or move >= float(params.get("trailAt", 1.2)) * atr_v:
-                    new_sl = price - float(params.get("trailDistance", 1.2)) * atr_v if side == "buy" else price + float(params.get("trailDistance", 1.2)) * atr_v
+                if entry.get("tpArmed") or move >= float(params.get("trailAt", 1.2)) * pos_atr:
+                    new_sl = price - float(params.get("trailDistance", 1.2)) * pos_atr if side == "buy" else price + float(params.get("trailDistance", 1.2)) * pos_atr
                     better = (side == "buy" and (cur_sl == 0 or new_sl > cur_sl + 1e-9)) or (side == "sell" and (cur_sl == 0 or new_sl < cur_sl - 1e-9))
                     if better:
                         try:
@@ -1393,7 +1433,7 @@ class AIAgent:
                                 "id": "t%d" % int(time.time() * 1000), "at": _iso(), "action": "trail",
                                 "symbol": pos.get("symbol"), "side": side, "confidence": float(row.get("confidence") or 0),
                                 "price": price, "volume": pos.get("volume"),
-                                "reason": "Trailing stop to %.5f after %.1f×ATR move." % (new_sl, move / atr_v),
+                                "reason": "Trailing stop to %.5f after %.1f×ATR move." % (new_sl, move / pos_atr),
                                 "ticket": pos.get("ticket"),
                             })
                         except Exception as e:
@@ -1717,9 +1757,11 @@ class AIAgent:
             if profit:
                 if loss_streak >= 2 or today_trades >= 4:
                     break
-                if float(cand.get("flowQuality") or 0) < 0.25:
+                if not cand.get("validatedPattern"):
                     continue
-                if float(cand.get("flowAlignment") or 0) < 0:
+                if cand.get("flowAvailable") and float(cand.get("flowQuality") or 0) < 0.25:
+                    continue
+                if cand.get("flowAvailable") and float(cand.get("flowAlignment") or 0) < 0:
                     continue
                 if float(cand.get("patternScore") or 0) < 0.25:
                     continue
@@ -1730,12 +1772,13 @@ class AIAgent:
                 atr_gate = float(cand.get("atr") or 0)
                 if atr_gate <= 0 or float(cand.get("spread") or 0) > float(params.get("maxSpreadAtr", 0.12)) * atr_gate:
                     continue
-                if str(cand.get("regime") or "") not in ("trend", "volatile"):
+                if not cand.get("validatedPattern") and str(cand.get("regime") or "") not in ("trend", "volatile"):
                     continue
-                if float(cand.get("adx") or 0) < 18:
+                adx_gate = float(cand.get("h1Adx") or cand.get("adx") or 0)
+                if adx_gate < 18:
                     continue
                 board_bias = str((komz_state.get("factorBoard") or {}).get("bias") or "neutral")
-                if board_bias in ("buy", "sell") and board_bias != str(cand.get("side") or ""):
+                if not cand.get("validatedPattern") and board_bias in ("buy", "sell") and board_bias != str(cand.get("side") or ""):
                     continue
             spec = (market.get(sym) or {}).get("spec") or {}
             price = float(cand.get("ask") or cand.get("bid") or price)
@@ -1876,6 +1919,8 @@ class AIAgent:
                 "contributions": cand.get("contributions") or {}, "riskAmount": risk_amount,
                 "decisionId": decision["id"], "flip": bool(flip),
                 "pattern": cand.get("patternName"), "patternScore": cand.get("patternScore"),
+                "timeStopHours": cand.get("timeStopHours"), "timeframe": cand.get("timeframe"),
+                "riskAtr": cand.get("riskAtr"),
             })
             state.setdefault("lastTradeAt", {})[sym] = now
             open_count += 1
