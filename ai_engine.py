@@ -1783,7 +1783,13 @@ class AIAgent:
         closed = state.get("closed") or []
         stats = compute_stats(closed, float(state.get("startingEquity") or equity))
         state["stats"] = stats
-        params, learn_note = adapt(params, stats, 0.05 if flip else 0.08 if aggressive else 0.15)
+        params, learn_note = adapt(params, stats, 0.55 if profit else 0.05 if flip else 0.08 if aggressive else 0.15)
+        if profit:
+            params["riskPct"] = min(float(params.get("riskPct") or 0.5), 0.5)
+            params["threshold"] = max(float(params.get("threshold") or 0.55), 0.55)
+            params["minConfidence"] = max(float(params.get("minConfidence") or 0.55), 0.55)
+            params["maxPositions"] = 2
+            params["flip"] = False
         generation = int(stats.get("trades") or 0) // 20
         state["generation"] = generation
         state["params"] = params
