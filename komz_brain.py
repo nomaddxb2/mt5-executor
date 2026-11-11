@@ -332,7 +332,7 @@ class KomzCouncil:
             working = list(chosen)
             probes = []
         else:
-            candidates = chosen[:4]
+            candidates = chosen[: self.max_models]
             working = []
             for mid in candidates:
                 if mid == self.brain.model:
@@ -371,6 +371,21 @@ class KomzCouncil:
             self.models = models
             self._models_at = time.time()
         return models
+
+    def trader_models(self, limit: int = 6) -> List[Dict[str, Any]]:
+        """Return the unique chat models available to the arena."""
+        models = self._discover()
+        out: List[Dict[str, Any]] = []
+        seen = set()
+        for model in models:
+            mid = str(model.get("id") or "")
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            out.append(dict(model))
+            if len(out) >= max(1, int(limit)):
+                break
+        return out
 
     def _member(self, model: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -826,6 +841,63 @@ class KomzBrain:
             "If the setup is unclear, reject. Learn from every outcome and keep a compact, reusable playbook. "
             "Return ONLY one strict JSON object with the requested keys. No markdown, no prose outside JSON."
         )
+
+    def decide(
+        self,
+        model_id: Optional[str],
+        account_id: str,
+        cfg: Dict[str, Any],
+        state: Dict[str, Any],
+        candidate: Dict[str, Any],
+        market: Dict[str, Any],
+        info: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """One AI model's independent verdict for the arena."""
+        if not self.available() or not model_id:
+            return None
+        sym = str(candidate.get("symbol") or "")
+        side = str(candidate.get("side") or "")
+        if not sym or side not in ("buy", "sell"):
+            return None
+        context = self._context(state, info, market, [candidate])
+        context["candidate"] = context["candidates"][0] if context.get("candidates") else {}
+        context["rules"]["arena"] = True
+        context["rules"]["modelRole"] = str((state.get("modelRole") or "AI model"))
+        context["rules"]["modelName"] = str((state.get("modelName") or model_id))
+        system = (
+            "You are %s, an independent trader in LO's MT5 model arena. "
+            "You compete against other AI models on the same account. Each model has its own magic number, "
+            "positions, risk and P/L. You may only approve or reject the deterministic candidate; never invent a trade, "
+            "never change volume, never exceed the engine's 2%% risk cap. "
+            "Be decisive: approve a coherent edge with sane spread and portfolio risk, reject genuine danger. "
+            "Return ONLY one strict JSON object." % (state.get("modelName") or model_id)
+        )
+        user = (
+            "Review this candidate for your own book. Your role is %s. "
+            "The engine already enforces the risk cap; judge setup quality and portfolio fit.\n"
+            % (state.get("modelRole") or "AI model")
+            + json.dumps(context, separators=(",", ":"))[:6200]
+            + '\nReturn JSON: {"action":"approve|reject","confidence":0.0,"reason":"one sentence","risk_note":"one sentence","size_multiplier":0.5}'
+        )
+        parsed = self._json(system, user, max_tokens=700, reasoning="none", model=model_id, timeout=24)
+        if not parsed:
+            return None
+        action = str(parsed.get("action") or "").lower()
+        approve = action in ("approve", "buy", "sell", "enter", "long", "short")
+        if action in ("reject", "hold", "no", "wait", "skip"):
+            approve = False
+        confidence = _clamp(parsed.get("confidence"), 0.0, 1.0, 0.5)
+        if confidence < 0.25:
+            approve = False
+        return {
+            "action": "approve" if approve else "reject",
+            "confidence": round(confidence, 3),
+            "reason": str(parsed.get("reason") or "")[:280],
+            "riskNote": str(parsed.get("risk_note") or "")[:240],
+            "sizeMultiplier": round(_clamp(parsed.get("size_multiplier"), 0.25, 1.0, 1.0), 3),
+            "model": str(model_id),
+            "at": _iso(),
+        }
 
     def review_entry(
         self,

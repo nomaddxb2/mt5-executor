@@ -7,6 +7,7 @@ a human-readable reason that the terminal streams live.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -42,6 +43,67 @@ ZERO_STATS = {
     "expectancy": 0,
     "maxDrawdownPct": 0,
     "avgR": 0,
+}
+
+ARENA_VERSION = 2
+ARENA_START_MAGIC = 20261110
+ARENA_BEST_MAGIC = 20261120
+
+AI_LENSES = {
+    "Momentum": {
+        "weights": {"trend": 0.50, "momentum": 0.30, "breakout": 0.15, "meanrev": 0.05},
+        "symbols": ["BTCUSD", "XAUUSD", "EURUSD"],
+        "riskPct": 0.35, "maxPositions": 2, "minConfidence": 0.22,
+        "atrSl": 1.6, "atrTp": 2.8, "maxSpreadAtr": 0.25,
+    },
+    "Mean Reversion": {
+        "weights": {"trend": 0.10, "momentum": 0.15, "breakout": 0.10, "meanrev": 0.65},
+        "symbols": ["XAUUSD", "EURUSD"],
+        "riskPct": 0.30, "maxPositions": 2, "minConfidence": 0.20,
+        "atrSl": 1.4, "atrTp": 2.2, "maxSpreadAtr": 0.22,
+    },
+    "Risk Guardian": {
+        "weights": {"trend": 0.35, "momentum": 0.15, "breakout": 0.15, "meanrev": 0.35},
+        "symbols": ["BTCUSD", "XAUUSD", "EURUSD"],
+        "riskPct": 0.20, "maxPositions": 1, "minConfidence": 0.30,
+        "atrSl": 1.8, "atrTp": 3.0, "maxSpreadAtr": 0.15,
+    },
+    "Macro Scout": {
+        "weights": {"trend": 0.45, "momentum": 0.20, "breakout": 0.25, "meanrev": 0.10},
+        "symbols": ["XAUUSD", "EURUSD", "BTCUSD"],
+        "riskPct": 0.30, "maxPositions": 2, "minConfidence": 0.24,
+        "atrSl": 1.7, "atrTp": 3.2, "maxSpreadAtr": 0.25,
+    },
+    "Devil's Advocate": {
+        "weights": {"trend": 0.15, "momentum": 0.15, "breakout": 0.10, "meanrev": 0.60},
+        "symbols": ["XAUUSD", "BTCUSD"],
+        "riskPct": 0.25, "maxPositions": 1, "minConfidence": 0.25,
+        "atrSl": 1.3, "atrTp": 2.0, "maxSpreadAtr": 0.20,
+    },
+    "Portfolio Chair": {
+        "weights": {"trend": 0.30, "momentum": 0.25, "breakout": 0.25, "meanrev": 0.20},
+        "symbols": ["BTCUSD", "XAUUSD", "EURUSD"],
+        "riskPct": 0.30, "maxPositions": 2, "minConfidence": 0.20,
+        "atrSl": 1.8, "atrTp": 3.2, "maxSpreadAtr": 0.25,
+    },
+}
+
+BEST_TRADER_SPEC = {
+    "id": "best-trader",
+    "name": "Best Trader · Gold Trend",
+    "role": "Best Trader",
+    "lens": "MQL5 #1 gold trend proxy",
+    "kind": "best-trader",
+    "aiModel": None,
+    "useBrain": False,
+    "magic": ARENA_BEST_MAGIC,
+    "config": {
+        "enabled": True, "mode": "balanced", "symbols": ["XAUUSD"], "focusSymbols": ["XAUUSD"],
+        "riskPct": 0.35, "maxPositions": 1, "minConfidence": 0.30, "maxDailyLossPct": 2.0,
+        "dryRun": False, "komz": False, "flipMode": False, "h1Trend": True,
+        "h1MinScore": 0.55, "h1Confidence": 0.55, "h1SlMult": 1.5, "h1TpMult": 3.0,
+        "cooldownSec": 600, "timeStopHours": 36,
+    },
 }
 
 
@@ -507,11 +569,14 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
     side = "buy" if score > 0 else "sell" if score < 0 else None
     patterns = detect_patterns(m15, tfs.get("M5") or [], atr_v, adx_v, ema_fast, ema_slow, rsi_v)
     h1_best = None
-    if params.get("profit"):
+    if params.get("h1Trend"):
+        min_h1 = float(params.get("h1MinScore") or 0.55)
+        h1_best = max((p for p in h1_patterns if float(p.get("score") or 0) >= min_h1), key=lambda p: float(p.get("score") or 0), default=None)
+    elif params.get("profit"):
         h1_best = max((p for p in h1_patterns if p.get("name") == "h1_session_breakout" and float(p.get("score") or 0) >= 0.60), key=lambda p: float(p.get("score") or 0), default=None)
     if h1_best:
         side = str(h1_best.get("side") or "")
-        confidence = max(confidence, 0.72)
+        confidence = max(confidence, float(params.get("h1Confidence") or (0.72 if params.get("profit") else 0.55)))
     combined = h1_patterns + patterns
     aligned = [p for p in combined if side and p.get("side") == side]
     if h1_best:
@@ -520,8 +585,8 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
     if side and pattern_score and not h1_best:
         confidence = _clamp(confidence + pattern_score * 0.12, 0.0, 1.0)
     risk_atr = h1_atr if h1_best else atr_v
-    sl_mult = 1.0 if h1_best else float(params.get("atrSl", 1.8))
-    tp_mult = 1.0 if h1_best else float(params.get("atrTp", 3.2))
+    sl_mult = float(params.get("h1SlMult") or 1.0) if h1_best else float(params.get("atrSl", 1.8))
+    tp_mult = float(params.get("h1TpMult") or 1.0) if h1_best else float(params.get("atrTp", 3.2))
 
     threshold = max(float(params.get("threshold", 0.15)), float(params.get("minConfidence", 0.15)))
     reasons: List[str] = []
@@ -964,13 +1029,294 @@ class AIAgent:
                 self.refresh()
                 for row in list(self.accounts):
                     try:
-                        self.run_account(row)
+                        cfg = row.get("config") or {}
+                        if cfg.get("arenaEnabled", True):
+                            self.run_arena(row)
+                        else:
+                            self.run_account(row)
                     except Exception as e:
                         self.log("ai account %s failed: %s" % (row.get("accountId"), e))
                         self._post_error(row, e)
             except Exception as e:
                 self.log("ai loop error: %s" % e)
             stop_event.wait(self.interval)
+
+    def _arena_specs(self, arena: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        discovered: List[Dict[str, Any]] = []
+        if self.brain:
+            try:
+                discovered = self.brain.council.trader_models(6)
+            except Exception as e:
+                self.log("arena model discovery failed: %s" % e)
+        if not discovered and self.brain:
+            discovered = [{"id": self.brain.model, "label": str(self.brain.model).split("/")[-1], "role": "Portfolio Chair", "lens": "balanced"}]
+        specs: List[Dict[str, Any]] = []
+        seen = set()
+        used_magics = {int(BEST_TRADER_SPEC["magic"])}
+        for model in ((arena or {}).get("models") or {}).values():
+            if model.get("magic"):
+                used_magics.add(int(model["magic"]))
+        for item in discovered:
+            mid = str(item.get("id") or "")
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            role = str(item.get("role") or "Portfolio Chair")
+            lens = AI_LENSES.get(role, AI_LENSES["Portfolio Chair"])
+            short = hashlib.sha1(mid.encode("utf-8")).hexdigest()[:8]
+            allowed = {
+                "Momentum": ["trend_breakout", "momentum_ignition", "trend_pullback", "session_breakout"],
+                "Mean Reversion": ["range_fade", "liquidity_sweep"],
+                "Risk Guardian": ["trend_pullback", "trend_breakout", "session_breakout"],
+                "Macro Scout": ["trend_breakout", "session_breakout", "trend_pullback"],
+                "Devil's Advocate": ["range_fade", "liquidity_sweep"],
+                "Portfolio Chair": ["trend_breakout", "trend_pullback", "momentum_ignition", "range_fade", "liquidity_sweep", "session_breakout"],
+            }.get(role, [])
+            cfg = {
+                "enabled": True,
+                "mode": "balanced",
+                "symbols": list(lens["symbols"]),
+                "focusSymbols": list(lens["symbols"])[:2],
+                "riskPct": lens["riskPct"],
+                "maxPositions": lens["maxPositions"],
+                "minConfidence": lens["minConfidence"],
+                "maxDailyLossPct": 2.0,
+                "dryRun": False,
+                "komz": True,
+                "flipMode": False,
+                "atrSl": lens["atrSl"],
+                "atrTp": lens["atrTp"],
+                "maxSpreadAtr": lens["maxSpreadAtr"],
+                "cooldownSec": 300,
+                "timeStopHours": 24,
+                "allowedPatterns": allowed,
+                "minPatternScore": 0.20 if role != "Risk Guardian" else 0.35,
+                "aiDecisionInterval": 300,
+            }
+            magic = ARENA_START_MAGIC + (int(hashlib.sha1(mid.encode("utf-8")).hexdigest()[:6], 16) % 4000)
+            while magic in used_magics:
+                magic += 1
+            used_magics.add(magic)
+            specs.append({
+                "id": "ai-" + short,
+                "name": str(item.get("label") or mid.split("/")[-1])[:40],
+                "role": role,
+                "lens": str(item.get("lens") or ""),
+                "kind": "ai",
+                "aiModel": mid,
+                "useBrain": True,
+                "magic": magic,
+                "weights": dict(lens["weights"]),
+                "config": cfg,
+            })
+        known = {str(spec["id"]) for spec in specs}
+        for model in ((arena or {}).get("models") or {}).values():
+            mid = str(model.get("id") or "")
+            if not mid or mid in known or mid == BEST_TRADER_SPEC["id"]:
+                continue
+            specs.append({
+                "id": mid,
+                "name": model.get("name") or mid,
+                "role": model.get("role") or "AI model",
+                "lens": model.get("lens") or "",
+                "kind": model.get("kind") or "ai",
+                "aiModel": model.get("aiModel"),
+                "useBrain": bool(model.get("useBrain", True)),
+                "magic": int(model.get("magic") or ARENA_START_MAGIC),
+                "weights": dict(model.get("weights") or DEFAULT_WEIGHTS),
+                "config": dict(model.get("config") or {}),
+            })
+        specs.append({
+            "id": BEST_TRADER_SPEC["id"],
+            "name": BEST_TRADER_SPEC["name"],
+            "role": BEST_TRADER_SPEC["role"],
+            "lens": BEST_TRADER_SPEC["lens"],
+            "kind": BEST_TRADER_SPEC["kind"],
+            "aiModel": None,
+            "useBrain": False,
+            "magic": BEST_TRADER_SPEC["magic"],
+            "weights": {"trend": 0.55, "momentum": 0.15, "breakout": 0.25, "meanrev": 0.05},
+            "config": dict(BEST_TRADER_SPEC["config"]),
+        })
+        return specs
+
+    def _arena_save(self, state: Dict[str, Any], model: Dict[str, Any], model_state: Dict[str, Any]) -> None:
+        model["state"] = model_state
+        arena = state.setdefault("arena", {})
+        arena["updatedAt"] = _iso()
+
+    def _arena_close(self, creds: Dict[str, Any], magics: set, state: Dict[str, Any]) -> int:
+        closed = 0
+        with self._locked():
+            try:
+                positions = self.pool.positions(creds) or []
+            except Exception as e:
+                state["error"] = "arena close scan failed: %s" % e
+                return 0
+            for pos in positions:
+                if int(pos.get("magic") or 0) not in magics:
+                    continue
+                try:
+                    self.pool.close_position(creds, {"ticket": pos.get("ticket")})
+                    closed += 1
+                except Exception as e:
+                    state["error"] = "arena close failed: %s" % e
+        return closed
+
+    def run_arena(self, row: Dict[str, Any]) -> None:
+        cfg = row.get("config") or {}
+        creds = row.get("credentials") or {}
+        account_id = row.get("accountId")
+        if not account_id or not creds or not cfg.get("enabled"):
+            return
+        state = row.get("state") or initial_state()
+        arena = state.get("arena")
+        fresh = not isinstance(arena, dict) or int(arena.get("version") or 0) != ARENA_VERSION
+        if fresh:
+            arena = {
+                "version": ARENA_VERSION,
+                "startedAt": _iso(),
+                "models": {},
+                "leaderboard": [],
+                "cycle": 0,
+                "legacy": {
+                    "closed": list(state.get("closed") or [])[-100:],
+                    "stats": dict(state.get("stats") or {}),
+                    "archivedAt": _iso(),
+                },
+            }
+            state["arena"] = arena
+            state["positions"] = []
+            state["closed"] = []
+            state["decisions"] = []
+            state["thoughts"] = []
+            state["stats"] = dict(ZERO_STATS)
+            state["thesis"] = None
+            state["market"] = []
+        state["arena"] = arena
+        specs = self._arena_specs(arena)
+        magics = {int(s["magic"]) for s in specs} | {MAGIC}
+        if fresh:
+            arena["migrationClosed"] = self._arena_close(creds, magics, state)
+
+        command = str(cfg.get("command") or "")
+        if command in ("reset", "close_all"):
+            if fresh:
+                closed = arena.get("migrationClosed", 0)
+            else:
+                closed = self._arena_close(creds, magics, state)
+                arena["lastCommand"] = {"command": command, "closed": closed, "at": _iso()}
+                if command == "reset":
+                    arena["previous"] = {"models": arena.get("models") or {}, "archivedAt": _iso()}
+                    arena["models"] = {}
+                    arena["leaderboard"] = []
+                    arena["startedAt"] = _iso()
+                    arena["startingEquity"] = None
+                    arena["cycle"] = 0
+            state["commandAck"] = command
+            cfg = dict(cfg)
+            cfg.pop("command", None)
+            cfg.pop("commandAt", None)
+        row_for_model = dict(row)
+        row_for_model["config"] = cfg
+        row_for_model["state"] = state
+
+        for spec in specs:
+            model = arena["models"].get(spec["id"]) or {}
+            magic = int(model.get("magic") or spec["magic"])
+            model.update({
+                "id": spec["id"],
+                "name": spec["name"],
+                "role": spec["role"],
+                "lens": spec["lens"],
+                "kind": spec["kind"],
+                "aiModel": spec["aiModel"],
+                "magic": magic,
+                "config": dict(spec["config"]),
+                "weights": dict(spec.get("weights") or DEFAULT_WEIGHTS),
+                "useBrain": bool(spec.get("useBrain")),
+            })
+            mstate = model.get("state")
+            if not isinstance(mstate, dict):
+                mstate = initial_state()
+            mstate["modelId"] = spec["id"]
+            mstate["modelName"] = spec["name"]
+            mstate["modelRole"] = spec["role"]
+            mstate["modelKind"] = spec["kind"]
+            mstate["aiModel"] = spec["aiModel"]
+            mstate["magic"] = magic
+            mstate["startedAt"] = mstate.get("startedAt") or _iso()
+            model["state"] = mstate
+            arena["models"][spec["id"]] = model
+            try:
+                self.run_account(row_for_model, model=model, post=lambda s, m=model: self._arena_save(state, m, s))
+            except Exception as e:
+                mstate["error"] = str(e)
+                mstate["running"] = False
+                self.log("arena model %s failed: %s" % (spec["id"], e))
+
+        if not arena.get("startingEquity"):
+            for model in arena["models"].values():
+                eq = (model.get("state") or {}).get("startingEquity")
+                if eq:
+                    arena["startingEquity"] = round(float(eq), 2)
+                    break
+        arena["leaderboard"] = self._arena_leaderboard(arena)
+        arena["cycle"] = int(arena.get("cycle") or 0) + 1
+        arena["updatedAt"] = _iso()
+        arena["running"] = True
+        arena["modelCount"] = len(arena["models"])
+        state["arena"] = arena
+        state["running"] = True
+        state["error"] = None
+        state["cycle"] = arena["cycle"]
+        state["updatedAt"] = _iso()
+        self._post(account_id, state)
+        if self.on_account:
+            try:
+                self.on_account(account_id, creds)
+            except Exception as e:
+                self.log("ai account callback failed: %s" % e)
+
+    def _arena_leaderboard(self, arena: Dict[str, Any]) -> List[Dict[str, Any]]:
+        start = float(arena.get("startingEquity") or 0)
+        rows: List[Dict[str, Any]] = []
+        for model in (arena.get("models") or {}).values():
+            s = model.get("state") or {}
+            stats = s.get("stats") or {}
+            pnl = float(s.get("aiPnl") or 0)
+            equity = round((start + pnl), 2) if start else None
+            ret = round((pnl / start * 100.0), 2) if start else 0.0
+            rows.append({
+                "id": model.get("id"),
+                "name": model.get("name"),
+                "role": model.get("role"),
+                "lens": model.get("lens"),
+                "kind": model.get("kind"),
+                "aiModel": model.get("aiModel"),
+                "magic": model.get("magic"),
+                "pnl": round(pnl, 2),
+                "equity": equity,
+                "returnPct": ret,
+                "trades": int(stats.get("trades") or 0),
+                "winRate": float(stats.get("winRate") or 0),
+                "profitFactor": float(stats.get("profitFactor") or 0),
+                "expectancy": float(stats.get("expectancy") or 0),
+                "maxDrawdownPct": float(stats.get("maxDrawdownPct") or 0),
+                "positions": len(s.get("positions") or []),
+                "cycle": int(s.get("cycle") or 0),
+                "running": bool(s.get("running")),
+                "halted": bool(s.get("halted")),
+                "confidence": float((s.get("lastAiReview") or {}).get("confidence") or 0),
+                "aiOffline": bool(s.get("aiOffline")),
+                "error": s.get("error") or s.get("aiError"),
+                "updatedAt": s.get("updatedAt"),
+                "lastDecision": (s.get("decisions") or [{}])[-1] if s.get("decisions") else None,
+            })
+        rows.sort(key=lambda r: (r.get("pnl") or 0), reverse=True)
+        for i, r in enumerate(rows):
+            r["rank"] = i + 1
+        return rows
 
     def _post(self, account_id: str, state: Dict[str, Any]) -> None:
         state["updatedAt"] = _iso()
@@ -985,16 +1331,17 @@ class AIAgent:
         state["running"] = False
         self._post(row.get("accountId"), state)
 
-    def run_account(self, row: Dict[str, Any]) -> None:
-        cfg = row.get("config") or {}
+    def run_account(self, row: Dict[str, Any], model: Optional[Dict[str, Any]] = None, post=None) -> None:
+        cfg = (model or {}).get("config") or row.get("config") or {}
         creds = row.get("credentials") or {}
         account_id = row.get("accountId")
-        use_brain = bool(self.brain and cfg.get("komz", True))
+        model_id = str((model or {}).get("id") or "komz")
+        magic = int((model or {}).get("magic") or cfg.get("magic") or MAGIC)
+        use_brain = bool(self.brain and cfg.get("komz", True) and (not model or model.get("useBrain")))
         if not account_id or not creds or not cfg.get("enabled"):
             return
-        state = row.get("state") or initial_state()
+        state = (model or {}).get("state") or row.get("state") or initial_state()
         state.setdefault("params", dict(DEFAULT_PARAMS))
-        state.setdefault("weights", dict(DEFAULT_WEIGHTS))
         state.setdefault("learning", {})
         state.setdefault("closed", [])
         state.setdefault("decisions", [])
@@ -1003,6 +1350,17 @@ class AIAgent:
         state.setdefault("lastTradeAt", {})
         state.setdefault("lastHoldAt", {})
         state.setdefault("lastRiskHoldAt", {})
+        if model and not state.get("weightsInitialized"):
+            state["weights"] = dict(model.get("weights") or DEFAULT_WEIGHTS)
+            state["weightsInitialized"] = True
+        state.setdefault("weights", dict(DEFAULT_WEIGHTS))
+        if model:
+            state["modelId"] = model_id
+            state["modelName"] = model.get("name") or model_id
+            state["modelRole"] = model.get("role") or "AI model"
+            state["modelKind"] = model.get("kind") or "ai"
+            state["aiModel"] = model.get("aiModel")
+            state["magic"] = magic
         komz_state = state.setdefault("komz", initial_state()["komz"])
         if self.brain:
             try:
@@ -1016,7 +1374,10 @@ class AIAgent:
                     komz_state.update(self.brain.status())
                 except Exception:
                     pass
-            self._post(account_id, state)
+            if post:
+                post(state)
+            else:
+                self._post(account_id, state)
         params = dict(DEFAULT_PARAMS)
         params.update(state.get("params") or {})
         profile = str(cfg.get("mode") or "balanced").lower()
@@ -1025,7 +1386,9 @@ class AIAgent:
         if flip:
             profile = "flip"
         aggressive = profile == "aggressive"
-        for key in ("riskPct", "maxPositions", "minConfidence", "maxDailyLossPct"):
+        for key in ("riskPct", "maxPositions", "minConfidence", "maxDailyLossPct", "atrSl", "atrTp",
+                    "trailAt", "trailDistance", "cooldownSec", "timeStopHours", "maxSpreadAtr",
+                    "h1Trend", "h1MinScore", "h1Confidence", "h1SlMult", "h1TpMult"):
             if cfg.get(key) is not None:
                 params[key] = cfg[key]
         if flip:
@@ -1109,7 +1472,7 @@ class AIAgent:
         elif command == "close_all":
             with self._locked():
                 try:
-                    positions = [p for p in (self.pool.positions(creds) or []) if int(p.get("magic") or 0) == MAGIC]
+                    positions = [p for p in (self.pool.positions(creds) or []) if int(p.get("magic") or 0) == magic]
                     for p in positions:
                         self.pool.close_position(creds, {"ticket": p.get("ticket")})
                 except Exception as e:
@@ -1126,7 +1489,7 @@ class AIAgent:
             self.pool.connect(creds)
             info = self.pool.account(creds) or {}
             all_positions = self.pool.positions(creds) or []
-            ai_positions = [p for p in all_positions if int(p.get("magic") or 0) == MAGIC]
+            ai_positions = [p for p in all_positions if int(p.get("magic") or 0) == magic]
             for sym in symbols:
                 tfs: Dict[str, List[Dict[str, Any]]] = {}
                 tfs_list = ("M1", "M5", "M15", "H1") if flip else ("M5", "M15", "H1")
@@ -1667,7 +2030,7 @@ class AIAgent:
                             res = self.pool.open_position(creds, {
                                 "symbol": row.get("symbol"), "side": side, "volume": lots,
                                 "stopLoss": round(sl, _digits(price)), "takeProfit": 0,
-                                "magic": MAGIC, "comment": "flip-hedge",
+                                "magic": magic, "comment": "flip-hedge",
                             })
                         order = res.get("order") or {}
                         ticket = order.get("ticket")
@@ -1733,6 +2096,13 @@ class AIAgent:
             if open_count >= int(params.get("maxPositions", 3)):
                 break
             if sym in open_symbols:
+                continue
+            allowed_patterns = cfg.get("allowedPatterns")
+            if allowed_patterns and str(cand.get("patternName") or "") not in allowed_patterns:
+                continue
+            if float(cand.get("patternScore") or 0) < float(cfg.get("minPatternScore") or 0):
+                continue
+            if cfg.get("h1Trend") and str(cand.get("timeframe") or "") != "H1":
                 continue
             price = float(cand.get("price") or 0)
             if flip and _base(sym) in recent_losses:
@@ -1841,7 +2211,51 @@ class AIAgent:
                     state.setdefault("lastRiskHoldAt", {})[sym] = now
                 continue
             review = None
-            if use_brain and reviews_done < 2 and not flip:
+            if model and model.get("kind") == "ai" and use_brain and not flip:
+                last_ai = float(state.get("lastAiDecisionAt") or 0)
+                ai_cooldown = float(state.get("aiCooldownUntil") or 0)
+                decision_interval = float(cfg.get("aiDecisionInterval") or 300)
+                if now - last_ai >= decision_interval and now >= ai_cooldown:
+                    try:
+                        review = self.brain.decide(model.get("aiModel"), account_id, cfg, state, cand, market, info)
+                    except Exception as e:
+                        self.log("arena model %s decision failed: %s" % (model.get("name"), e))
+                    state["lastAiDecisionAt"] = now
+                    if review:
+                        state["aiOffline"] = False
+                        state["aiError"] = None
+                        state["lastAiReview"] = {
+                            "model": model.get("name"),
+                            "action": review.get("action"),
+                            "confidence": review.get("confidence"),
+                            "reason": review.get("reason"),
+                            "riskNote": review.get("riskNote"),
+                            "at": review.get("at") or _iso(),
+                        }
+                        komz_state["lastReview"] = review
+                        if review.get("action") == "reject":
+                            state["decisions"].append({
+                                "id": "k%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
+                                "symbol": sym, "side": None, "confidence": cand.get("confidence"),
+                                "price": price, "volume": lots,
+                                "reason": "%s veto: %s%s" % (
+                                    model.get("name") or "Model",
+                                    review.get("reason") or "setup rejected",
+                                    (" · " + review.get("riskNote")) if review.get("riskNote") else "",
+                                ),
+                            })
+                            continue
+                        cand["komzReview"] = review
+                        mult = max(0.25, min(1.0, float(review.get("sizeMultiplier") or 1.0)))
+                        if mult < 1.0:
+                            scaled = position_size(equity, risk_pct * mult, sl_dist, spec)
+                            if scaled > 0:
+                                lots = scaled
+                    else:
+                        state["aiOffline"] = True
+                        state["aiError"] = "model unavailable or rate limited"
+                        state["aiCooldownUntil"] = now + 300
+            elif use_brain and reviews_done < 2 and not flip:
                 reviews_done += 1
                 try:
                     review = self.brain.review_entry(account_id, cfg, state, cand, market, info, progress=progress)
@@ -1884,7 +2298,7 @@ class AIAgent:
                         "volume": lots,
                         "stopLoss": cand.get("sl"),
                         "takeProfit": 0 if flip else cand.get("tp"),
-                        "magic": MAGIC,
+                        "magic": magic,
                         "comment": "ai-evolve",
                     })
                 order = res.get("order") or {}
@@ -1904,7 +2318,7 @@ class AIAgent:
                 "action": cand.get("side"), "symbol": sym, "side": cand.get("side"),
                 "confidence": cand.get("confidence"), "price": fill, "volume": lots,
                 "reason": " ".join(cand.get("reasons") or []) + (
-                    (" · Komz: " + str((cand.get("komzReview") or {}).get("reason") or "")) if cand.get("komzReview") else ""
+                    (" · " + str(state.get("modelName") or "Model") + ": " + str((cand.get("komzReview") or {}).get("reason") or "")) if cand.get("komzReview") else ""
                 ) + (
                     (" · Council: " + str(((cand.get("komzReview") or {}).get("council") or {}).get("summary") or "")) if (cand.get("komzReview") or {}).get("council") else ""
                 ),
@@ -2057,12 +2471,25 @@ class AIAgent:
         state["thoughts"] = thoughts[-30:]
         state["decisions"] = state["decisions"][-60:]
         state["nextReviewAt"] = _iso(now + self.interval)
-        self._post(account_id, state)
-        if self.on_account:
-            try:
-                self.on_account(account_id, creds)
-            except Exception as e:
-                self.log("ai account callback failed: %s" % e)
+        if model:
+            start_equity = float(state.get("startingEquity") or equity or 0)
+            virtual = start_equity + float(state.get("aiPnl") or 0)
+            state["virtualEquity"] = round(virtual, 2)
+            vcurve = list(state.get("virtualCurve") or [])
+            vcurve.append({"at": _iso(), "equity": round(virtual, 2), "pnl": round(float(state.get("aiPnl") or 0), 2)})
+            state["virtualCurve"] = vcurve[-240:]
+            vpeak = max([float(x.get("equity") or virtual) for x in state["virtualCurve"]] or [virtual])
+            state["virtualPeak"] = round(vpeak, 2)
+            state["virtualDrawdownPct"] = round(((vpeak - virtual) / vpeak * 100.0) if vpeak else 0.0, 2)
+        if post:
+            post(state)
+        else:
+            self._post(account_id, state)
+            if self.on_account:
+                try:
+                    self.on_account(account_id, creds)
+                except Exception as e:
+                    self.log("ai account callback failed: %s" % e)
 
     def _serialize_position(self, pos: Dict[str, Any], reason: Optional[str]) -> Dict[str, Any]:
         return {
