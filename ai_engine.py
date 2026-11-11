@@ -107,6 +107,13 @@ BEST_TRADER_SPEC = {
 }
 
 
+def _trade_comment(text: Any, fallback: str = "AI") -> str:
+    raw = " ".join(str(text or "").split())
+    raw = raw.replace("·", "-").replace("|", "-").replace("/", "-")
+    clean = "".join(ch for ch in raw if 32 <= ord(ch) < 127).strip()
+    return (clean or str(fallback or "AI"))[:31].strip() or "AI"
+
+
 def _iso(ts: Optional[float] = None) -> str:
     return datetime.fromtimestamp(ts if ts is not None else time.time(), tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -1145,6 +1152,17 @@ class AIAgent:
         arena = state.setdefault("arena", {})
         arena["updatedAt"] = _iso()
 
+    def _arena_notify(self, account_id: str, kind: str, text: str) -> None:
+        if not self.brain:
+            return
+        memory = getattr(self.brain, "memory", None)
+        if not memory:
+            return
+        try:
+            memory.write(account_id, kind, text, title="Arena")
+        except Exception as e:
+            self.log("arena telegram failed: %s" % e)
+
     def _arena_close(self, creds: Dict[str, Any], magics: set, state: Dict[str, Any]) -> int:
         closed = 0
         with self._locked():
@@ -1195,6 +1213,22 @@ class AIAgent:
             state["market"] = []
         state["arena"] = arena
         specs = self._arena_specs(arena)
+        roster_ids = [str(spec["id"]) for spec in specs]
+        if arena.get("telegramRoster") != roster_ids:
+            lines = ["🧩 ARENA ROSTER · %d competitors" % len(specs)]
+            for index, spec in enumerate(specs, 1):
+                scfg = spec.get("config") or {}
+                lines.append("%d. %s · %s · %s · risk %.2f%% · max %d · magic %s" % (
+                    index,
+                    spec["name"],
+                    spec["role"],
+                    ",".join(scfg.get("symbols") or []) or "—",
+                    float(scfg.get("riskPct") or 0),
+                    int(scfg.get("maxPositions") or 0),
+                    spec["magic"],
+                ))
+            self._arena_notify(account_id, "roster", "\n".join(lines))
+            arena["telegramRoster"] = roster_ids
         magics = {int(s["magic"]) for s in specs} | {MAGIC}
         if fresh:
             arena["migrationClosed"] = self._arena_close(creds, magics, state)
@@ -1254,6 +1288,8 @@ class AIAgent:
                 mstate["error"] = str(e)
                 mstate["running"] = False
                 self.log("arena model %s failed: %s" % (spec["id"], e))
+                self._arena_notify(account_id, "error", "⚠️ %s · cycle failed: %s" % (
+                    spec.get("name") or spec["id"], str(e)[:240]))
 
         if not arena.get("startingEquity"):
             for model in arena["models"].values():
@@ -1263,6 +1299,24 @@ class AIAgent:
                     break
         arena["leaderboard"] = self._arena_leaderboard(arena)
         arena["cycle"] = int(arena.get("cycle") or 0) + 1
+        board_at = float(arena.get("telegramBoardAt") or 0)
+        if arena["leaderboard"] and time.time() - board_at >= 300:
+            medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+            lines = ["🏆 ARENA LEADERBOARD · cycle %d" % arena["cycle"]]
+            for row in arena["leaderboard"]:
+                lines.append("%s #%d %s · %s · P/L %+.2f · %d trades · %.1f%% win · PF %.2f · %d open" % (
+                    medals.get(int(row.get("rank") or 0), "•"),
+                    int(row.get("rank") or 0),
+                    row.get("name") or "model",
+                    row.get("role") or "AI",
+                    float(row.get("pnl") or 0),
+                    int(row.get("trades") or 0),
+                    float(row.get("winRate") or 0),
+                    float(row.get("profitFactor") or 0),
+                    int(row.get("positions") or 0),
+                ))
+            self._arena_notify(account_id, "leaderboard", "\n".join(lines))
+            arena["telegramBoardAt"] = time.time()
         arena["updatedAt"] = _iso()
         arena["running"] = True
         arena["modelCount"] = len(arena["models"])
@@ -1337,6 +1391,7 @@ class AIAgent:
         account_id = row.get("accountId")
         model_id = str((model or {}).get("id") or "komz")
         magic = int((model or {}).get("magic") or cfg.get("magic") or MAGIC)
+        taker = _trade_comment((model or {}).get("name") or cfg.get("modelName") or "Komz")
         use_brain = bool(self.brain and cfg.get("komz", True) and (not model or model.get("useBrain")))
         if not account_id or not creds or not cfg.get("enabled"):
             return
@@ -1624,6 +1679,27 @@ class AIAgent:
                 "pnl": round(pnl, 2),
             })
 
+        for rec in closed_now:
+            self._arena_notify(account_id, "trade", (
+                "%s TRADE CLOSED\n"
+                "⚔️ %s · %s\n"
+                "📉 %s %s %.2f lots\n"
+                "💵 P/L %+.2f · %+.2fR\n"
+                "🏷 magic %s · #%s\n"
+                "💬 %s"
+            ) % (
+                "💰" if float(rec.get("pnl") or 0) > 0 else "🔻" if float(rec.get("pnl") or 0) < 0 else "⚪",
+                state.get("modelName") or "AI model",
+                state.get("modelRole") or "AI",
+                rec.get("symbol") or "—",
+                str(rec.get("side") or "").upper(),
+                float(rec.get("volume") or 0),
+                float(rec.get("pnl") or 0),
+                float(rec.get("r") or 0),
+                state.get("magic") or magic,
+                rec.get("ticket"),
+                str(rec.get("reason") or "closed")[:200],
+            ))
         if closed_now and use_brain:
             try:
                 lesson = self.brain.reflect(account_id, cfg, state, closed_now[0], info)
@@ -2030,7 +2106,7 @@ class AIAgent:
                             res = self.pool.open_position(creds, {
                                 "symbol": row.get("symbol"), "side": side, "volume": lots,
                                 "stopLoss": round(sl, _digits(price)), "takeProfit": 0,
-                                "magic": magic, "comment": "flip-hedge",
+                                "magic": magic, "comment": taker,
                             })
                         order = res.get("order") or {}
                         ticket = order.get("ticket")
@@ -2233,6 +2309,29 @@ class AIAgent:
                             "at": review.get("at") or _iso(),
                         }
                         komz_state["lastReview"] = review
+                        state["telegramOffline"] = False
+                        verdict = "✅ APPROVED" if review.get("action") == "approve" else "❌ REJECTED"
+                        self._arena_notify(account_id, "thinking", (
+                            "⚔️ %s · %s\n"
+                            "🧠 %s · %s %s\n"
+                            "📊 conf %.2f · %s · %s\n"
+                            "💭 %s\n"
+                            "🛡 %s\n"
+                            "⚖️ size x%.2f · magic %s"
+                        ) % (
+                            state.get("modelName") or "AI model",
+                            state.get("modelRole") or "AI",
+                            verdict,
+                            sym,
+                            str(cand.get("side") or "").upper(),
+                            float(cand.get("confidence") or 0),
+                            cand.get("patternName") or "setup",
+                            cand.get("timeframe") or "M15",
+                            review.get("reason") or "—",
+                            review.get("riskNote") or "—",
+                            float(review.get("sizeMultiplier") or 1.0),
+                            state.get("magic") or magic,
+                        ))
                         if review.get("action") == "reject":
                             state["decisions"].append({
                                 "id": "k%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
@@ -2255,6 +2354,11 @@ class AIAgent:
                         state["aiOffline"] = True
                         state["aiError"] = "model unavailable or rate limited"
                         state["aiCooldownUntil"] = now + 300
+                        if not state.get("telegramOffline"):
+                            self._arena_notify(account_id, "thinking", (
+                                "⚠️ %s · %s\n🧠 model unavailable or rate limited; deterministic lens stays armed."
+                            ) % (state.get("modelName") or "AI model", state.get("modelRole") or "AI"))
+                            state["telegramOffline"] = True
             elif use_brain and reviews_done < 2 and not flip:
                 reviews_done += 1
                 try:
@@ -2299,7 +2403,7 @@ class AIAgent:
                         "stopLoss": cand.get("sl"),
                         "takeProfit": 0 if flip else cand.get("tp"),
                         "magic": magic,
-                        "comment": "ai-evolve",
+                        "comment": taker,
                     })
                 order = res.get("order") or {}
                 ticket = order.get("ticket")
@@ -2311,6 +2415,8 @@ class AIAgent:
                     "symbol": sym, "side": cand.get("side"), "confidence": cand.get("confidence"),
                     "price": price, "volume": lots, "reason": "Execution rejected: %s" % e,
                 })
+                self._arena_notify(account_id, "error", "⚠️ %s · execution rejected on %s: %s" % (
+                    state.get("modelName") or "AI model", sym, str(e)[:240]))
                 continue
             risk_amount = abs(fill - sl) * (float(spec.get("tickValue") or 1.0) / float(spec.get("tickSize") or 1.0)) * lots if spec else abs(fill - sl) * lots * 100000.0
             decision = {
@@ -2336,6 +2442,31 @@ class AIAgent:
                 "timeStopHours": cand.get("timeStopHours"), "timeframe": cand.get("timeframe"),
                 "riskAtr": cand.get("riskAtr"),
             })
+            self._arena_notify(account_id, "trade", (
+                "🟢 TRADE OPEN\n"
+                "⚔️ %s · %s\n"
+                "📈 %s %s %.2f lots @ %s\n"
+                "🛑 SL %s · 🎯 TP %s\n"
+                "🧠 conf %.2f · %s · %s\n"
+                "🏷 magic %s · #%s · %s\n"
+                "💬 %s"
+            ) % (
+                state.get("modelName") or "AI model",
+                state.get("modelRole") or "AI",
+                sym,
+                str(cand.get("side") or "").upper(),
+                float(lots or 0),
+                fill,
+                cand.get("sl") if cand.get("sl") is not None else "—",
+                cand.get("tp") if cand.get("tp") is not None else "—",
+                float(cand.get("confidence") or 0),
+                cand.get("patternName") or "setup",
+                cand.get("timeframe") or "M15",
+                state.get("magic") or magic,
+                ticket,
+                taker,
+                str(decision.get("reason") or "")[:240],
+            ))
             state.setdefault("lastTradeAt", {})[sym] = now
             open_count += 1
             open_symbols.add(sym)

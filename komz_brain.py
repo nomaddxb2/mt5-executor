@@ -160,7 +160,7 @@ class KomzMemory:
             self.log("komz telegram discovery failed: %s" % _redact(e))
         return False
 
-    def _telegram(self, text: str, kind: str) -> bool:
+    def _telegram(self, text: str, kind: str, title: str = "Komz") -> bool:
         if not self.token:
             return False
         if not self.chat_id and not self._discover_chat():
@@ -168,7 +168,7 @@ class KomzMemory:
         parts = _chunks(text)
         sent = 0
         for index, part in enumerate(parts, 1):
-            header = "[Komz · %s · %s · %d/%d]\n" % (kind, _iso(), index, len(parts))
+            header = "[%s · %s · %s · %d/%d]\n" % (title, kind, _iso(), index, len(parts))
             try:
                 res = requests.post(
                     TELEGRAM_API % (self.token, "sendMessage"),
@@ -246,10 +246,10 @@ class KomzMemory:
                 return ok > 0
         return ok > 0
 
-    def write(self, account_id: str, kind: str, text: str) -> Dict[str, Any]:
+    def write(self, account_id: str, kind: str, text: str, title: str = "Komz") -> Dict[str, Any]:
         with self._lock:
             payload = "%s\n\n%s" % (_iso(), text)
-            telegram_ok = self._telegram(payload, kind)
+            telegram_ok = self._telegram(payload, kind, title=title)
             supabase_ok = self._supabase(account_id, kind, payload)
             self.chunks += len(_chunks(payload))
             self.last_write_at = _iso()
