@@ -111,7 +111,7 @@ def _trade_comment(text: Any, fallback: str = "AI") -> str:
     raw = " ".join(str(text or "").split())
     raw = raw.replace("·", "-").replace("|", "-").replace("/", "-")
     clean = "".join(ch for ch in raw if 32 <= ord(ch) < 127).strip()
-    return (clean or str(fallback or "AI"))[:31].strip() or "AI"
+    return (clean or str(fallback or "AI"))[:26].strip() or "AI"
 
 
 def _iso(ts: Optional[float] = None) -> str:
@@ -1539,7 +1539,7 @@ class AIAgent:
                 try:
                     positions = [p for p in (self.pool.positions(creds) or []) if int(p.get("magic") or 0) == magic]
                     for p in positions:
-                        self.pool.close_position(creds, {"ticket": p.get("ticket")})
+                        self.pool.close_position(creds, {"ticket": p.get("ticket"), "comment": taker})
                 except Exception as e:
                     state["error"] = "close_all: %s" % e
             state["commandAck"] = "close_all"
@@ -1771,7 +1771,7 @@ class AIAgent:
             if close_reason and not dry:
                 with self._locked():
                     try:
-                        self.pool.close_position(creds, {"ticket": pos.get("ticket")})
+                        self.pool.close_position(creds, {"ticket": pos.get("ticket"), "comment": taker})
                         res = self.pool.deal_result(creds, pos.get("ticket"))
                         pnl = float(res.get("profit") or 0)
                     except Exception as e:

@@ -836,7 +836,7 @@ class TerminalPool:
             "price": float(tick.bid if is_buy else tick.ask),
             "deviation": DEFAULT_DEVIATION,
             "magic": pos.magic,
-            "comment": "mt5-bridge close",
+            "comment": str(payload.get("comment") or "mt5-bridge close")[:26],
             "type_time": mt5.ORDER_TIME_GTC,
         }
         result = self._send(request)

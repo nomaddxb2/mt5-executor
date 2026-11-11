@@ -199,7 +199,7 @@ int Filling(const string sym)
    return ORDER_FILLING_RETURN;
 }
 
-void DoOpen(const string id, const string sym, const string type, const double vol, const double sl, const double tp, const string comment)
+void DoOpen(const string id, const string sym, const string type, const double vol, const double sl, const double tp, const string comment, const long magic)
 {
    MqlTradeRequest req;
    MqlTradeResult res;
@@ -211,7 +211,7 @@ void DoOpen(const string id, const string sym, const string type, const double v
    req.sl = sl;
    req.tp = tp;
    req.deviation = 50;
-   req.magic = 20261109;
+   req.magic = (magic > 0 ? magic : 20261109);
    req.comment = comment;
    req.type_filling = (ENUM_ORDER_TYPE_FILLING)Filling(sym);
    if(type == "sell")
@@ -228,7 +228,7 @@ void DoOpen(const string id, const string sym, const string type, const double v
    WriteResult(id, ok && (res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED), res.comment, res.deal, res.order, res.retcode);
 }
 
-void DoPending(const string id, const string sym, const string type, const double vol, const double price, const double sl, const double tp, const string comment)
+void DoPending(const string id, const string sym, const string type, const double vol, const double price, const double sl, const double tp, const string comment, const long magic)
 {
    MqlTradeRequest req;
    MqlTradeResult res;
@@ -241,7 +241,7 @@ void DoPending(const string id, const string sym, const string type, const doubl
    req.sl = sl;
    req.tp = tp;
    req.deviation = 50;
-   req.magic = 20261109;
+   req.magic = (magic > 0 ? magic : 20261109);
    req.comment = comment;
    req.type_time = ORDER_TIME_GTC;
    req.type_filling = (ENUM_ORDER_TYPE_FILLING)Filling(sym);
@@ -351,13 +351,14 @@ void ReadCommand()
    double price = JNum(js, "price");
    double sl = JNum(js, "sl");
    double tp = JNum(js, "tp");
+   long magic = (long)JNum(js, "magic");
    ulong ticket = (ulong)JNum(js, "ticket");
    if(comment == "")
       comment = "bridge";
    if(op == "open")
-      DoOpen(id, sym, type, vol, sl, tp, comment);
+      DoOpen(id, sym, type, vol, sl, tp, comment, magic);
    else if(op == "pending")
-      DoPending(id, sym, type, vol, price, sl, tp, comment);
+      DoPending(id, sym, type, vol, price, sl, tp, comment, magic);
    else if(op == "close")
       DoClose(id, ticket, vol, comment);
    else if(op == "modify")
