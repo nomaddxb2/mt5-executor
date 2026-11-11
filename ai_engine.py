@@ -1348,8 +1348,8 @@ class AIAgent:
         research_rows = komz_state.get("research") or []
         research_note = str(((research_rows[-1] or {}).get("notes") or [""])[0])[:140] if research_rows else "research queued"
         hedge_bits = ", ".join("%s %s" % (_base(p.get("symbol")), str(p.get("side") or "").upper()) for p in state.get("positions") or [] if p.get("hedge")) or "opening"
-        hedge_net = ", ".join("%s %+.2f" % (s.get("symbol"), float(s.get("netLots") or 0)) for s in factor_board.get("symbols", []) if s.get("symbol") in ("BTCUSD", "XAUUSD")) or "flat"
         factor_board = build_factor_board(rows, equity, drawdown_pct, fr, research_rows, state.get("positions"))
+        hedge_net = ", ".join("%s %+.2f" % (s.get("symbol"), float(s.get("netLots") or 0)) for s in factor_board.get("symbols", []) if s.get("symbol") in ("BTCUSD", "XAUUSD")) or "flat"
         history = list(komz_state.get("factorHistory") or [])
         history.append({"at": factor_board["updatedAt"], "bias": factor_board["bias"],
                         "score": factor_board["score"], "confidence": factor_board["confidence"],
