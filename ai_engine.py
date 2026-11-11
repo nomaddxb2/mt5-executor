@@ -510,7 +510,9 @@ def analyze_symbol(symbol: str, tfs: Dict[str, List[Dict[str, Any]]], quote: Dic
 
 
 def build_factor_board(rows: List[Dict[str, Any]], equity: float, drawdown_pct: float,
-                       fr: Dict[str, Any], research_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+                       fr: Dict[str, Any], research_rows: List[Dict[str, Any]],
+                       positions: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    positions = positions or []
     research = (research_rows[-1] if research_rows else {}) or {}
     macro_state = str(research.get("regime") or research.get("bias") or "unknown")
     macro_note = str(((research.get("notes") or [""])[0]) or "research queued")[:140]
@@ -567,6 +569,14 @@ def build_factor_board(rows: List[Dict[str, Any]], equity: float, drawdown_pct: 
         add("risk", "Risk", -_clamp(drawdown_pct / 20.0, 0.0, 1.0), 0.0,
             "high" if drawdown_pct >= 10 else "normal",
             "drawdown %.1f%% · deficit $%.2f" % (drawdown_pct, float(fr.get("deficit") or 0)), "account")
+        base = _base(row.get("symbol"))
+        legs = [p for p in positions if _base(p.get("symbol")) == base]
+        buy_lots = sum(float(p.get("volume") or 0) for p in legs if str(p.get("side") or "").lower() == "buy")
+        sell_lots = sum(float(p.get("volume") or 0) for p in legs if str(p.get("side") or "").lower() == "sell")
+        net_lots = buy_lots - sell_lots
+        add("exposure", "Net exposure", 0.0, 0.0,
+            "long" if net_lots > 0 else "short" if net_lots < 0 else "flat",
+            "buy %.2f · sell %.2f · net %+.2f lots" % (buy_lots, sell_lots, net_lots), "positions")
 
         directional = [f for f in factors if f["weight"] > 0]
         total_w = sum(f["weight"] for f in directional) or 1.0
@@ -578,7 +588,7 @@ def build_factor_board(rows: List[Dict[str, Any]], equity: float, drawdown_pct: 
             "symbol": _base(row.get("symbol")), "bias": bias, "score": round(score, 3),
             "confidence": round(confidence, 3), "regime": row.get("regime"),
             "atrPct": row.get("atrPct"), "spreadAtr": round(spread_atr, 4),
-            "factors": factors,
+            "netLots": round(net_lots, 4), "factors": factors,
         })
         for f in factors:
             aggregate.setdefault(f["key"], []).append(f)
@@ -1123,15 +1133,16 @@ class AIAgent:
                     state["error"] = "tp strip failed: %s" % e
 
             close_reason = ""
+            hedge_leg = bool(flip and _base(pos.get("symbol")) in ("BTCUSD", "XAUUSD"))
             age_h = 0.0
             try:
                 opened = datetime.fromisoformat(str(pos.get("openedAt")).replace("Z", "+00:00"))
                 age_h = (datetime.now(timezone.utc) - opened).total_seconds() / 3600.0
             except Exception:
                 age_h = 0.0
-            if age_h >= float(params.get("timeStopHours", 24)) and not (flip and entry.get("tpArmed")):
+            if age_h >= float(params.get("timeStopHours", 24)) and not (flip and entry.get("tpArmed")) and not hedge_leg:
                 close_reason = "Time stop: position open %.1fh" % age_h
-            elif row.get("side") and row.get("side") != side and float(row.get("confidence") or 0) >= (max(0.20, float(params.get("threshold", 0.05))) if flip else max(0.45, float(params.get("threshold", 0.40)))):
+            elif not hedge_leg and row.get("side") and row.get("side") != side and float(row.get("confidence") or 0) >= (max(0.20, float(params.get("threshold", 0.05))) if flip else max(0.45, float(params.get("threshold", 0.40)))):
                 close_reason = "Opposite signal: %s confidence %.2f" % (row.get("side").upper(), float(row.get("confidence") or 0))
             if close_reason and not dry:
                 with self._locked():
@@ -1296,7 +1307,8 @@ class AIAgent:
         research_rows = komz_state.get("research") or []
         research_note = str(((research_rows[-1] or {}).get("notes") or [""])[0])[:140] if research_rows else "research queued"
         hedge_bits = ", ".join("%s %s" % (_base(p.get("symbol")), str(p.get("side") or "").upper()) for p in state.get("positions") or [] if p.get("hedge")) or "opening"
-        factor_board = build_factor_board(rows, equity, drawdown_pct, fr, research_rows)
+        hedge_net = ", ".join("%s %+.2f" % (s.get("symbol"), float(s.get("netLots") or 0)) for s in factor_board.get("symbols", []) if s.get("symbol") in ("BTCUSD", "XAUUSD")) or "flat"
+        factor_board = build_factor_board(rows, equity, drawdown_pct, fr, research_rows, state.get("positions"))
         history = list(komz_state.get("factorHistory") or [])
         history.append({"at": factor_board["updatedAt"], "bias": factor_board["bias"],
                         "score": factor_board["score"], "confidence": factor_board["confidence"],
@@ -1326,7 +1338,7 @@ class AIAgent:
             ("Research", "news, regime and session context", research_note),
             ("Macro", "USD, yields and cross-asset regime", "%s · %s" % (factor_board["regime"], research_note)),
             ("Risk", "drawdown, pair recovery lots and missed profit", "drawdown %.1f%% · multiplier %.2fx · deficit $%.2f" % (drawdown_pct, risk_mult, float(fr.get("deficit") or 0))),
-            ("Hedge", "two-sided BTC/Gold grid, side ladders, opposite TP/SL alignment", "active %s · side ladders %s" % (hedge_bits, pair_bits or "none")),
+            ("Hedge", "two-sided BTC/Gold grid, net exposure and opposite TP/SL alignment", "active %s · net %s · side ladders %s" % (hedge_bits, hedge_net, pair_bits or "none")),
             ("Execution", "spread/ATR, fills and slippage", "best spread/ATR %s · %d symbols" % (
                 min([("%s %.3f" % (s.get("symbol"), float(s.get("spreadAtr") or 0))) for s in factor_board["symbols"]], default="—"),
                 len(factor_board["symbols"]))),
