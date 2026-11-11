@@ -45,7 +45,7 @@ ZERO_STATS = {
     "avgR": 0,
 }
 
-ARENA_VERSION = 2
+ARENA_VERSION = 3
 ARENA_START_MAGIC = 20261110
 ARENA_BEST_MAGIC = 20261120
 
@@ -1052,7 +1052,7 @@ class AIAgent:
         discovered: List[Dict[str, Any]] = []
         if self.brain:
             try:
-                discovered = self.brain.council.trader_models(6)
+                discovered = self.brain.council.arena_models(6)
             except Exception as e:
                 self.log("arena model discovery failed: %s" % e)
         if not discovered and self.brain:
@@ -1065,12 +1065,13 @@ class AIAgent:
                 used_magics.add(int(model["magic"]))
         for item in discovered:
             mid = str(item.get("id") or "")
-            if not mid or mid in seen:
-                continue
-            seen.add(mid)
             role = str(item.get("role") or "Portfolio Chair")
+            seat = "%s|%s" % (mid, role)
+            if not mid or seat in seen:
+                continue
+            seen.add(seat)
             lens = AI_LENSES.get(role, AI_LENSES["Portfolio Chair"])
-            short = hashlib.sha1(mid.encode("utf-8")).hexdigest()[:8]
+            short = hashlib.sha1(seat.encode("utf-8")).hexdigest()[:8]
             allowed = {
                 "Momentum": ["trend_breakout", "momentum_ignition", "trend_pullback", "session_breakout"],
                 "Mean Reversion": ["range_fade", "liquidity_sweep"],
@@ -1100,13 +1101,13 @@ class AIAgent:
                 "minPatternScore": 0.20 if role != "Risk Guardian" else 0.35,
                 "aiDecisionInterval": 300,
             }
-            magic = ARENA_START_MAGIC + (int(hashlib.sha1(mid.encode("utf-8")).hexdigest()[:6], 16) % 4000)
+            magic = ARENA_START_MAGIC + (int(hashlib.sha1(seat.encode("utf-8")).hexdigest()[:6], 16) % 4000)
             while magic in used_magics:
                 magic += 1
             used_magics.add(magic)
             specs.append({
                 "id": "ai-" + short,
-                "name": str(item.get("label") or mid.split("/")[-1])[:40],
+                "name": (str(role) + " · " + str(item.get("label") or mid.split("/")[-1]))[:40],
                 "role": role,
                 "lens": str(item.get("lens") or ""),
                 "kind": "ai",
@@ -1189,6 +1190,11 @@ class AIAgent:
             return
         state = row.get("state") or initial_state()
         arena = state.get("arena")
+        legacy_magics = {
+            int(model.get("magic"))
+            for model in ((arena or {}).get("models") or {}).values()
+            if model.get("magic")
+        }
         fresh = not isinstance(arena, dict) or int(arena.get("version") or 0) != ARENA_VERSION
         if fresh:
             arena = {
@@ -1200,6 +1206,10 @@ class AIAgent:
                 "legacy": {
                     "closed": list(state.get("closed") or [])[-100:],
                     "stats": dict(state.get("stats") or {}),
+                    "models": [
+                        {"id": model.get("id"), "name": model.get("name"), "magic": model.get("magic")}
+                        for model in ((arena or {}).get("models") or {}).values()
+                    ],
                     "archivedAt": _iso(),
                 },
             }
@@ -1229,7 +1239,7 @@ class AIAgent:
                 ))
             self._arena_notify(account_id, "roster", "\n".join(lines))
             arena["telegramRoster"] = roster_ids
-        magics = {int(s["magic"]) for s in specs} | {MAGIC}
+        magics = {int(s["magic"]) for s in specs} | legacy_magics | {MAGIC}
         if fresh:
             arena["migrationClosed"] = self._arena_close(creds, magics, state)
 

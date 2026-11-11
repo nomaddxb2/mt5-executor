@@ -387,6 +387,10 @@ class KomzCouncil:
                 break
         return out
 
+    def arena_models(self, limit: int = 6) -> List[Dict[str, Any]]:
+        """Return one arena seat per council role, even when roles share a model."""
+        return [dict(model) for model in self._discover()[: max(1, int(limit))]]
+
     def _member(self, model: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": model["id"],
