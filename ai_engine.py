@@ -350,6 +350,18 @@ def _digits(price: float) -> int:
     return 5
 
 
+def _valid_stop(side: str, price: float, stop: float, point: float, stops_level: float = 0) -> bool:
+    if price <= 0 or stop <= 0:
+        return False
+    point = abs(float(point or 0)) or 0.00001
+    min_dist = max(abs(float(stops_level or 0)) * point, point * 2.0)
+    if side == "buy":
+        return stop < price - min_dist
+    if side == "sell":
+        return stop > price + min_dist
+    return False
+
+
 # ---------------------------------------------------------------- analysis
 def _closed(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [c for c in (candles or []) if c]
@@ -1017,6 +1029,18 @@ class AIAgent:
 
     def _locked(self):
         return self.lock if self.lock is not None else _NullLock()
+
+    def _fresh_price(self, creds: Dict[str, Any], symbol: str, side: str) -> float:
+        try:
+            rows = self.pool.prices(creds, [symbol]).get("prices") or []
+            if rows:
+                row = rows[0]
+                value = float(row.get("bid") if side == "buy" else row.get("ask") or 0)
+                if value > 0:
+                    return value
+        except Exception as e:
+            self.log("fresh price failed for %s: %s" % (symbol, e))
+        return 0.0
 
     def refresh(self, force: bool = False) -> None:
         if not force and self.accounts and time.time() - self.last_refresh < 5:
@@ -1738,8 +1762,15 @@ class AIAgent:
                 continue
             side = str(pos.get("side") or "").lower()
             price = float(row.get("bid") if side == "buy" else row.get("ask") or row.get("price") or 0)
+            fresh = self._fresh_price(creds, pos.get("symbol"), side)
+            if fresh > 0:
+                price = fresh
             atr_v = float(row.get("atr") or 0)
             open_price = float(pos.get("openPrice") or 0)
+            spec = (market.get(pos.get("symbol")) or market.get(_base(pos.get("symbol"))) or {}).get("spec") or {}
+            point = float(spec.get("point") or 0.00001)
+            stops_level = float(spec.get("stopsLevel") or 0)
+            digits = int(spec.get("digits") or _digits(price))
             entry = {"ticket": pos.get("ticket"), "symbol": pos.get("symbol"), "side": side,
                      "volume": pos.get("volume"), "openPrice": open_price, "currentPrice": pos.get("currentPrice"),
                      "profit": pos.get("profit"), "sl": pos.get("stopLoss"), "tp": pos.get("takeProfit"),
@@ -1808,7 +1839,7 @@ class AIAgent:
 
             # virtual TP: only arm after target + spread; lock enough to cover the opposite side + target
             if flip and float(entry.get("targetTp") or 0) <= 0 and atr_v > 0 and open_price > 0:
-                entry["targetTp"] = round(open_price + (0.7 * atr_v if side == "buy" else -0.7 * atr_v), _digits(price))
+                entry["targetTp"] = round(open_price + (0.7 * atr_v if side == "buy" else -0.7 * atr_v), digits)
             target_tp = float(entry.get("targetTp") or 0)
             if not dry and flip and atr_v > 0 and target_tp > 0 and not entry.get("tpArmed"):
                 spread = abs(float(row.get("ask") or 0) - float(row.get("bid") or 0))
@@ -1820,23 +1851,24 @@ class AIAgent:
                     pair_key = entry.get("pairKey") or "%s:%s" % (base, str(side or "").upper())
                     pair = (fr.get("pairs") or {}).get(pair_key) or {}
                     target_usd = max(0.5, float(pair.get("deficit") or 0) + float(pair.get("missedProfit") or fr.get("missedProfit") or 0))
-                    tick_value = float((market.get(pos.get("symbol")) or {}).get("spec", {}).get("tickValue") or 1.0)
-                    tick_size = float((market.get(pos.get("symbol")) or {}).get("spec", {}).get("tickSize") or 0.00001)
+                    tick_value = float(spec.get("tickValue") or 1.0)
+                    tick_size = float(spec.get("tickSize") or 0.00001)
                     usd_per_price = (tick_value / tick_size) * float(entry.get("volume") or 0.01) if tick_size else 0.0
                     need = (opp_loss + target_usd) / usd_per_price if usd_per_price > 0 else 0.0
                     lock_sl = open_price + need if side == "buy" else open_price - need
                     buffer = max(atr_v * 0.05, spread * 2.0, 0.0)
                     armed_sl = max(target_tp + buffer, lock_sl) if side == "buy" else min(target_tp - buffer, lock_sl)
                     can_arm = (side == "buy" and armed_sl < price) or (side == "sell" and armed_sl > price)
-                    cur_sl = float(pos.get("stopLoss") or 0)
+                    cur_sl = float(entry.get("sl") or 0)
                     better = (side == "buy" and (cur_sl == 0 or armed_sl > cur_sl + 1e-9)) or (side == "sell" and (cur_sl == 0 or armed_sl < cur_sl - 1e-9))
-                    if can_arm:
+                    valid = _valid_stop(side, price, armed_sl, point, stops_level)
+                    if can_arm and valid:
                         entry["tpArmed"] = True
-                    if can_arm and better:
+                    if can_arm and valid and better:
                         try:
                             with self._locked():
-                                self.pool.modify_position(creds, {"ticket": pos.get("ticket"), "stopLoss": round(armed_sl, _digits(price)), "takeProfit": 0})
-                            entry["sl"] = round(armed_sl, _digits(price))
+                                self.pool.modify_position(creds, {"ticket": pos.get("ticket"), "stopLoss": round(armed_sl, digits), "takeProfit": 0})
+                            entry["sl"] = round(armed_sl, digits)
                             entry["tpArmed"] = True
                             state["decisions"].append({
                                 "id": "a%d" % int(time.time() * 1000), "at": _iso(), "action": "arm",
@@ -1855,13 +1887,14 @@ class AIAgent:
                 if move >= 1.0 * pos_atr:
                     spread = abs(float(row.get("ask") or 0) - float(row.get("bid") or 0))
                     be_sl = open_price + max(spread * 2.0, pos_atr * 0.05) if side == "buy" else open_price - max(spread * 2.0, pos_atr * 0.05)
-                    cur_sl = float(pos.get("stopLoss") or 0)
+                    cur_sl = float(entry.get("sl") or 0)
                     better = (side == "buy" and (cur_sl == 0 or be_sl > cur_sl + 1e-9)) or (side == "sell" and (cur_sl == 0 or be_sl < cur_sl - 1e-9))
-                    if better:
+                    valid = _valid_stop(side, price, be_sl, point, stops_level)
+                    if better and valid:
                         try:
                             with self._locked():
-                                self.pool.modify_position(creds, {"ticket": pos.get("ticket"), "stopLoss": round(be_sl, _digits(price)), "takeProfit": pos.get("takeProfit") or 0})
-                            entry["sl"] = round(be_sl, _digits(price))
+                                self.pool.modify_position(creds, {"ticket": pos.get("ticket"), "stopLoss": round(be_sl, digits), "takeProfit": entry.get("tp") or 0})
+                            entry["sl"] = round(be_sl, digits)
                             entry["beMoved"] = True
                             state["decisions"].append({
                                 "id": "b%d" % int(time.time() * 1000), "at": _iso(), "action": "protect",
@@ -1876,15 +1909,16 @@ class AIAgent:
             # trailing stop / break-even
             if not dry and pos_atr > 0 and open_price > 0 and price > 0:
                 move = (price - open_price) if side == "buy" else (open_price - price)
-                cur_sl = float(pos.get("stopLoss") or 0)
+                cur_sl = float(entry.get("sl") or 0)
                 if entry.get("tpArmed") or move >= float(params.get("trailAt", 1.2)) * pos_atr:
                     new_sl = price - float(params.get("trailDistance", 1.2)) * pos_atr if side == "buy" else price + float(params.get("trailDistance", 1.2)) * pos_atr
                     better = (side == "buy" and (cur_sl == 0 or new_sl > cur_sl + 1e-9)) or (side == "sell" and (cur_sl == 0 or new_sl < cur_sl - 1e-9))
-                    if better:
+                    valid = _valid_stop(side, price, new_sl, point, stops_level)
+                    if better and valid:
                         try:
                             with self._locked():
-                                self.pool.modify_position(creds, {"ticket": pos.get("ticket"), "stopLoss": round(new_sl, _digits(price)), "takeProfit": 0 if flip else (pos.get("takeProfit") or 0)})
-                            entry["sl"] = round(new_sl, _digits(price))
+                                self.pool.modify_position(creds, {"ticket": pos.get("ticket"), "stopLoss": round(new_sl, digits), "takeProfit": 0 if flip else (entry.get("tp") or 0)})
+                            entry["sl"] = round(new_sl, digits)
                             state["decisions"].append({
                                 "id": "t%d" % int(time.time() * 1000), "at": _iso(), "action": "trail",
                                 "symbol": pos.get("symbol"), "side": side, "confidence": float(row.get("confidence") or 0),

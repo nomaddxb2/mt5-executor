@@ -1,7 +1,7 @@
-# Worker
+# MT5 Bridge executor
 
-Warm MT5 worker. This repository is generated from the private control plane.
-Do not edit it by hand.
+Warm MetaTrader 5 worker for MT5 Bridge. This repository is generated from
+the private control-plane repository. Do not edit it by hand.
 
 Workflows: `mt5-warm` keeps a terminal alive and chains itself, `mt5-watchdog`
 dispatches a replacement if no worker is online.
