@@ -1713,6 +1713,10 @@ class AIAgent:
                     continue
                 if float(cand.get("patternScore") or 0) < 0.25:
                     continue
+                p_name = str(cand.get("patternName") or "")
+                p_stat = (state.get("patternStats") or {}).get(p_name) or {}
+                if int(p_stat.get("trades") or 0) >= 5 and float(p_stat.get("pnl") or 0) <= 0:
+                    continue
                 atr_gate = float(cand.get("atr") or 0)
                 if atr_gate <= 0 or float(cand.get("spread") or 0) > float(params.get("maxSpreadAtr", 0.12)) * atr_gate:
                     continue
