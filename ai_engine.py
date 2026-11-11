@@ -1308,6 +1308,13 @@ class AIAgent:
                     arena["startingEquity"] = round(float(eq), 2)
                     break
         arena["leaderboard"] = self._arena_leaderboard(arena)
+        if arena["leaderboard"]:
+            lead = arena["leaderboard"][0]
+            lead_state = ((arena["models"].get(lead.get("id")) or {}).get("state") or {})
+            state["equity"] = lead_state.get("equity")
+            state["balance"] = lead_state.get("balance")
+            state["aiPnl"] = round(sum(float(row.get("pnl") or 0) for row in arena["leaderboard"]), 2)
+            state["floating"] = round(sum(float(((arena["models"].get(row.get("id")) or {}).get("state") or {}).get("floating") or 0) for row in arena["leaderboard"]), 2)
         arena["cycle"] = int(arena.get("cycle") or 0) + 1
         board_at = float(arena.get("telegramBoardAt") or 0)
         if arena["leaderboard"] and time.time() - board_at >= 300:
@@ -2403,6 +2410,25 @@ class AIAgent:
                     "reason": "Dry run: would %s %.2f lots. %s" % (cand.get("side").upper(), lots, " ".join(cand.get("reasons") or [])),
                 })
                 continue
+            if model and model.get("kind") == "best-trader":
+                self._arena_notify(account_id, "thinking", (
+                    "🧠 BEST TRADER SIGNAL\n"
+                    "⚔️ %s · %s\n"
+                    "📊 %s %s · conf %.2f · %s · %s\n"
+                    "💭 %s\n"
+                    "⚖️ risk %.2f%% · magic %s"
+                ) % (
+                    state.get("modelName") or "Best Trader",
+                    state.get("modelRole") or "Best Trader",
+                    sym,
+                    str(cand.get("side") or "").upper(),
+                    float(cand.get("confidence") or 0),
+                    cand.get("patternName") or "setup",
+                    cand.get("timeframe") or "H1",
+                    " ".join((cand.get("reasons") or [])[:2]) or "signal",
+                    float(risk_pct or 0),
+                    state.get("magic") or magic,
+                ))
             ticket = None
             try:
                 with self._locked():
