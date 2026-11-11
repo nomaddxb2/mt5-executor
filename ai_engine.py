@@ -1974,7 +1974,7 @@ class AIAgent:
             "note": "Full recovery is confirmed only when equity >= peak and all positions are closed.",
         }
         state["market"] = [
-            {k: r.get(k) for k in ("symbol", "price", "bid", "ask", "spread", "rsi", "atr", "atrPct", "trend", "regime", "score", "confidence", "side", "holdReason", "flowAvailable", "flowScore", "flowAlignment", "flowPressure", "depthImbalance", "tickDeltaRatio", "bidDepth", "askDepth", "patterns", "patternScore", "patternName")}
+            {k: r.get(k) for k in ("symbol", "price", "bid", "ask", "spread", "rsi", "atr", "atrPct", "trend", "regime", "score", "confidence", "side", "holdReason", "flowAvailable", "flowScore", "flowAlignment", "flowQuality", "flowPressure", "depthImbalance", "tickDeltaRatio", "bidDepth", "askDepth", "patterns", "patternScore", "patternName")}
             for r in rows if r.get("ok")
         ]
         if top and top.get("ok"):
