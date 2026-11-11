@@ -8,8 +8,9 @@ import urllib.request
 
 import MetaTrader5 as mt5
 
-TERMINAL = r"C:\mt5\terminal64.exe"
-DATA = r"C:\mt5"
+PRIMARY_TERMINAL = os.environ.get("MT5_TERMINAL_PATH", r"C:\mt5\terminal64.exe")
+ALT_TERMINAL = os.environ.get("MT5_TERMINAL_ALT_PATH", r"C:\mt5b\terminal64.exe")
+ALT_MATCH = str(os.environ.get("MT5_TERMINAL_ALT_MATCH") or "").strip().lower()
 API = (os.environ.get("MT5_API_URL") or "").rstrip("/")
 SECRET = os.environ.get("MT5_WORKER_SECRET") or ""
 SHARD = int(os.environ.get("MT5_SHARD") or 0)
@@ -32,8 +33,14 @@ def api(path, body):
         return json.loads(res.read().decode("utf-8"))
 
 
-def log_tail(limit=4000):
-    paths = sorted(glob.glob(os.path.join(DATA, "logs", "*.log")))
+def terminal_for(server):
+    if ALT_MATCH and ALT_MATCH in str(server or "").lower():
+        return ALT_TERMINAL
+    return PRIMARY_TERMINAL
+
+
+def log_tail(limit=4000, data=None):
+    paths = sorted(glob.glob(os.path.join(data or os.path.dirname(PRIMARY_TERMINAL), "logs", "*.log")))
     if not paths:
         return ""
     try:
@@ -43,8 +50,8 @@ def log_tail(limit=4000):
         return "<log error %s>" % exc
 
 
-def write_ini(creds):
-    path = os.path.join(DATA, "config", "start.ini")
+def write_ini(creds, data):
+    path = os.path.join(data, "config", "start.ini")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     body = "\n".join(
         [
@@ -77,9 +84,6 @@ def main():
     if not API or not SECRET:
         out("MT5_API_URL and MT5_WORKER_SECRET are required")
         return 2
-    if not os.path.exists(TERMINAL):
-        out("terminal missing", TERMINAL)
-        return 2
     payload = api("/v1/worker/ai/accounts", {"shard": SHARD, "shards": SHARDS})
     rows = payload.get("accounts") or []
     out("accounts", len(rows))
@@ -90,13 +94,18 @@ def main():
     if not creds.get("login") or not creds.get("password") or not creds.get("server"):
         out("account credentials incomplete")
         return 2
-    out("login", creds.get("login"), "server", creds.get("server"))
+    terminal = terminal_for(creds.get("server"))
+    data = os.path.dirname(terminal)
+    if not os.path.exists(terminal):
+        out("terminal missing", terminal)
+        return 2
+    out("login", creds.get("login"), "server", creds.get("server"), "terminal", terminal)
 
     subprocess.run(["taskkill", "/F", "/IM", "terminal64.exe"], capture_output=True, text=True, timeout=25)
     time.sleep(3)
-    ini = write_ini(creds)
+    ini = write_ini(creds, data)
     out("start.ini", ini, "bytes", os.path.getsize(ini))
-    proc = subprocess.Popen([TERMINAL, "/portable", "/config:" + ini], cwd=DATA, close_fds=True)
+    proc = subprocess.Popen([terminal, "/portable", "/config:" + ini], cwd=data, close_fds=True)
     out("terminal pid", proc.pid)
 
     deadline = time.time() + 120
@@ -104,7 +113,7 @@ def main():
     while time.time() < deadline:
         time.sleep(3)
         try:
-            ok = mt5.initialize(path=TERMINAL, timeout=15000, portable=True)
+            ok = mt5.initialize(path=terminal, timeout=15000, portable=True)
         except Exception as exc:
             ok = False
             last = str(exc)
@@ -136,7 +145,7 @@ def main():
         except Exception:
             pass
     out("boot failed", last)
-    out("log tail", log_tail(8000))
+    out("log tail", log_tail(8000, data))
     return 1
 
 

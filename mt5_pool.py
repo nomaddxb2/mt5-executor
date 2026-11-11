@@ -16,9 +16,13 @@ try:
 except Exception:  # pragma: no cover - Linux and dry runs
     mt5 = None
 
-TERMINAL_PATH = os.environ.get(
+PRIMARY_TERMINAL_PATH = os.environ.get(
     "MT5_TERMINAL_PATH", r"C:\mt5\terminal64.exe"
 )
+ALT_TERMINAL_PATH = os.environ.get(
+    "MT5_TERMINAL_ALT_PATH", r"C:\mt5b\terminal64.exe"
+)
+ALT_SERVER_MATCH = str(os.environ.get("MT5_TERMINAL_ALT_MATCH") or "").strip().lower()
 DEFAULT_DEVIATION = int(os.environ.get("MT5_DEVIATION", "30"))
 WATCHLIST = [
     s.strip().upper()
@@ -112,6 +116,27 @@ def _norm_symbol(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
 
 
+def _parse_symbol_map(raw: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for pair in str(raw or "").split(","):
+        if ":" not in pair:
+            continue
+        key, value = pair.split(":", 1)
+        key, value = key.strip(), value.strip()
+        if key and value:
+            out[_norm_symbol(key)] = value
+    return out
+
+
+SYMBOL_MAP = _parse_symbol_map(os.environ.get("MT5_SYMBOL_MAP", ""))
+
+
+def _terminal_for(server: Any) -> str:
+    if ALT_SERVER_MATCH and ALT_SERVER_MATCH in str(server or "").lower():
+        return ALT_TERMINAL_PATH
+    return PRIMARY_TERMINAL_PATH
+
+
 def _symbol_score(requested: str, broker: str, aliases: List[str]) -> int:
     req = _norm_symbol(requested)
     got = _norm_symbol(broker)
@@ -137,6 +162,7 @@ class TerminalPool:
         self.dry_run = dry_run or os.environ.get("MT5_DRY_RUN") == "1"
         self.current: Optional[Dict[str, Any]] = None
         self.connected_at: Optional[float] = None
+        self.terminal_path = PRIMARY_TERMINAL_PATH
         self._symbol_cache: Dict[str, Any] = {}
         self._symbol_rows_cache = None
         self._symbol_rows_at = 0.0
@@ -157,6 +183,7 @@ class TerminalPool:
         if mt5 is None:
             raise Mt5Error("MetaTrader5 package is not available on this host", "mt5_missing")
         key = (str(credentials.get("login")), str(credentials.get("server")))
+        self.terminal_path = _terminal_for(credentials.get("server"))
         if self.current and (str(self.current.get("login")), str(self.current.get("server"))) == key:
             return self.status(credentials)
         self._symbol_cache.clear()
@@ -173,7 +200,7 @@ class TerminalPool:
         print("[mt5-pool] attach login=%s server=%s timeout=%sms" % (key[0], key[1], timeout_ms), flush=True)
         # Attach to the terminal that the warm workflow already started.
         try:
-            ok = mt5.initialize(path=TERMINAL_PATH, timeout=timeout_ms, portable=True)
+            ok = mt5.initialize(path=self.terminal_path, timeout=timeout_ms, portable=True)
             print("[mt5-pool] initialize=%s error=%s" % (ok, mt5.last_error()), flush=True)
         except Exception as exc:
             print("[mt5-pool] initialize exception=%s" % exc, flush=True)
@@ -199,7 +226,7 @@ class TerminalPool:
             if ok:
                 break
             ok = mt5.initialize(
-                path=TERMINAL_PATH,
+                path=self.terminal_path,
                 login=int(credentials.get("login")),
                 password=str(credentials.get("password")),
                 server=str(credentials.get("server")),
@@ -227,7 +254,7 @@ class TerminalPool:
                 {
                     "code": last_code,
                     "message": last_message,
-                    "path": TERMINAL_PATH,
+                    "path": self.terminal_path,
                     "terminalRunning": self._terminal_running(),
                     "logs": self._tail_logs(),
                 },
@@ -256,11 +283,11 @@ class TerminalPool:
             return False
 
     def _launch_terminal(self) -> None:
-        if not os.path.exists(TERMINAL_PATH):
-            raise Mt5Error("Terminal not found at %s" % TERMINAL_PATH, "mt5_missing")
+        if not os.path.exists(self.terminal_path):
+            raise Mt5Error("Terminal not found at %s" % self.terminal_path, "mt5_missing")
         subprocess.Popen(
-            [TERMINAL_PATH, "/portable"],
-            cwd=os.path.dirname(TERMINAL_PATH),
+            [self.terminal_path, "/portable"],
+            cwd=os.path.dirname(self.terminal_path),
             close_fds=True,
         )
         time.sleep(5)
@@ -268,7 +295,7 @@ class TerminalPool:
     def _tail_logs(self, limit: int = 20) -> List[str]:
         try:
             files = sorted(
-                glob.glob(os.path.join(os.path.dirname(TERMINAL_PATH), "logs", "*.log")),
+                glob.glob(os.path.join(os.path.dirname(self.terminal_path), "logs", "*.log")),
                 key=os.path.getmtime,
             )
             if not files:
@@ -290,7 +317,7 @@ class TerminalPool:
 
     def _terminal_info(self) -> Dict[str, Any]:
         if self.dry_run or mt5 is None:
-            return {"name": "MT5 dry-run", "build": 0, "company": "MT5 Bridge"}
+            return {"name": "MT5 dry-run", "build": 0, "company": "dry-run"}
         info = mt5.terminal_info()
         if info is None:
             return {}
@@ -973,7 +1000,7 @@ class TerminalPool:
 
     # ---------------------------------------------------------------- helpers
     def _write_start_ini(self, credentials: Dict[str, Any]) -> str:
-        path = os.path.join(os.path.dirname(TERMINAL_PATH), "config", "start.ini")
+        path = os.path.join(os.path.dirname(self.terminal_path), "config", "start.ini")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         body = "\n".join(
             [
@@ -1019,8 +1046,8 @@ class TerminalPool:
         try:
             ini = self._write_start_ini(credentials)
             subprocess.Popen(
-                [TERMINAL_PATH, "/portable", "/config:" + ini],
-                cwd=os.path.dirname(TERMINAL_PATH),
+                [self.terminal_path, "/portable", "/config:" + ini],
+                cwd=os.path.dirname(self.terminal_path),
                 close_fds=True,
             )
         except Exception:
@@ -1029,7 +1056,7 @@ class TerminalPool:
         while time.time() < deadline:
             time.sleep(3)
             try:
-                if mt5.initialize(path=TERMINAL_PATH, timeout=15000, portable=True):
+                if mt5.initialize(path=self.terminal_path, timeout=15000, portable=True):
                     ai = mt5.account_info()
                     ti = mt5.terminal_info()
                     if (
@@ -1055,6 +1082,14 @@ class TerminalPool:
         cached = self._symbol_cache.get(name)
         if cached and time.time() - cached[1] < 60:
             return cached[0]
+        mapped = SYMBOL_MAP.get(_norm_symbol(name))
+        if mapped:
+            try:
+                if mt5.symbol_info(mapped) is not None:
+                    self._symbol_cache[name] = (mapped, time.time())
+                    return mapped
+            except Exception:
+                pass
         aliases = _SYMBOL_ALIASES.get(_norm_symbol(name), [name])
         variants = [name] + [name + s for s in _SYMBOL_SUFFIXES] + [p + name for p in _SYMBOL_PREFIXES]
         for variant in variants:

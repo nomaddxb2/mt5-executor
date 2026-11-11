@@ -48,6 +48,11 @@ jobs:
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     runs-on: windows-latest
     timeout-minutes: 350
+    env:
+      PRIMARY_INSTALLER_URL: ${{ secrets.MT5_PRIMARY_INSTALLER_URL }}
+      PRIMARY_MATCH: ${{ secrets.MT5_PRIMARY_SERVER_MATCH }}
+      ALT_INSTALLER_URL: ${{ secrets.MT5_ALT_INSTALLER_URL }}
+      ALT_MATCH: ${{ secrets.MT5_ALT_SERVER_MATCH }}
     steps:
       - uses: actions/checkout@v4
 
@@ -64,24 +69,34 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\mt5
-          key: mt5-exness-6314
+          key: mt5-primary-6314
 
       - name: Install MetaTrader 5
         if: steps.mt5-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $setup = Join-Path $env:RUNNER_TEMP 'exness5setup.exe'
-          Invoke-WebRequest -Uri 'https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe' -OutFile $setup
+          if (-not $env:PRIMARY_INSTALLER_URL) { throw 'primary installer URL missing' }
+          $setup = Join-Path $env:RUNNER_TEMP 'primary5setup.exe'
+          Invoke-WebRequest -Uri $env:PRIMARY_INSTALLER_URL -OutFile $setup
           Start-Process -FilePath $setup -ArgumentList '/auto' -Wait
           $roots = @('C:\Program Files', 'C:\Program Files (x86)', (Join-Path $env:LOCALAPPDATA 'Programs'))
           $src = $null
           for ($i = 0; $i -lt 45 -and -not $src; $i++) {
-            $src = Get-ChildItem -Path $roots -Recurse -Depth 3 -Filter 'terminal64.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            $candidates = Get-ChildItem -Path $roots -Recurse -Depth 3 -Filter 'terminal64.exe' -ErrorAction SilentlyContinue
+            if ($env:PRIMARY_MATCH) {
+              $src = $candidates | Where-Object {
+                $origin = Join-Path $_.Directory.FullName 'origin.txt'
+                (Test-Path $origin) -and ((Get-Content $origin -Raw -ErrorAction SilentlyContinue) -match [regex]::Escape($env:PRIMARY_MATCH))
+              } | Select-Object -First 1
+            }
+            if (-not $src) {
+              $src = $candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            }
             if (-not $src) { Start-Sleep -Seconds 2 }
           }
           if (-not $src) {
             Get-ChildItem 'C:\Program Files' -Directory | Select-Object -ExpandProperty FullName
-            throw 'Exness MetaTrader 5 installation did not produce terminal64.exe'
+            throw 'MetaTrader 5 installation did not produce terminal64.exe'
           }
           $dir = $src.Directory.FullName
           Write-Host "found terminal at $dir"
@@ -97,6 +112,54 @@ jobs:
           if (!(Test-Path 'C:\mt5\terminal64.exe')) { throw 'C:\mt5\terminal64.exe is missing' }
           python -c "import MetaTrader5 as mt5; print('MetaTrader5', mt5.__version__)"
 
+      - name: Cache alternate MetaTrader 5 terminal
+        if: env.ALT_INSTALLER_URL != ''
+        id: mt5-alt-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\mt5b
+          key: mt5-alt-6316
+
+      - name: Install alternate MetaTrader 5
+        if: env.ALT_INSTALLER_URL != '' && steps.mt5-alt-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP 'alt5setup.exe'
+          Invoke-WebRequest -Uri $env:ALT_INSTALLER_URL -OutFile $setup
+          Start-Process -FilePath $setup -ArgumentList '/auto' -Wait
+          $roots = @('C:\Program Files', 'C:\Program Files (x86)', (Join-Path $env:LOCALAPPDATA 'Programs'))
+          $src = $null
+          for ($i = 0; $i -lt 45 -and -not $src; $i++) {
+            $candidates = Get-ChildItem -Path $roots -Recurse -Depth 3 -Filter 'terminal64.exe' -ErrorAction SilentlyContinue
+            if ($env:ALT_MATCH) {
+              $src = $candidates | Where-Object {
+                $origin = Join-Path $_.Directory.FullName 'origin.txt'
+                (Test-Path $origin) -and ((Get-Content $origin -Raw -ErrorAction SilentlyContinue) -match [regex]::Escape($env:ALT_MATCH))
+              } | Select-Object -First 1
+            }
+            if (-not $src) {
+              $src = $candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            }
+            if (-not $src) { Start-Sleep -Seconds 2 }
+          }
+          if (-not $src) {
+            Get-ChildItem 'C:\Program Files' -Directory | Select-Object -ExpandProperty FullName
+            throw 'Alternate MetaTrader 5 installation did not produce terminal64.exe'
+          }
+          $dir = $src.Directory.FullName
+          Write-Host "found alternate terminal at $dir"
+          New-Item -ItemType Directory -Force -Path 'C:\mt5b' | Out-Null
+          Copy-Item (Join-Path $dir '*') 'C:\mt5b' -Recurse -Force
+          Get-Item 'C:\mt5b\terminal64.exe' | Select-Object FullName, Length
+          Get-Item 'C:\mt5b\config\servers.dat' -ErrorAction SilentlyContinue | Select-Object Name, Length
+          Get-Content 'C:\mt5b\origin.txt' -ErrorAction SilentlyContinue
+
+      - name: Verify alternate terminal
+        if: env.ALT_INSTALLER_URL != ''
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'C:\mt5b\terminal64.exe')) { throw 'C:\mt5b\terminal64.exe is missing' }
+
       - name: Boot MT5 session
         shell: pwsh
         timeout-minutes: 4
@@ -105,6 +168,9 @@ jobs:
           MT5_WORKER_SECRET: ${{ secrets.MT5_WORKER_SECRET }}
           MT5_SHARD: ${{ matrix.shard }}
           MT5_SHARDS: ${{ needs.plan.outputs.count }}
+          MT5_TERMINAL_ALT_PATH: 'C:\mt5b\terminal64.exe'
+          MT5_TERMINAL_ALT_MATCH: ${{ secrets.MT5_ALT_SERVER_MATCH }}
+          MT5_SYMBOL_MAP: ${{ secrets.MT5_SYMBOL_MAP }}
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: '1'
         run: python mt5_boot.py
@@ -117,6 +183,9 @@ jobs:
           MT5_WORKER_ID: github-${{ github.run_id }}-${{ matrix.shard }}
           MT5_SHARD: ${{ matrix.shard }}
           MT5_SHARDS: ${{ needs.plan.outputs.count }}
+          MT5_TERMINAL_ALT_PATH: 'C:\mt5b\terminal64.exe'
+          MT5_TERMINAL_ALT_MATCH: ${{ secrets.MT5_ALT_SERVER_MATCH }}
+          MT5_SYMBOL_MAP: ${{ secrets.MT5_SYMBOL_MAP }}
           MT5_CONNECT_TIMEOUT_MS: '30000'
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: '1'
