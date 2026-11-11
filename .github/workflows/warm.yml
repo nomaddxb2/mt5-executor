@@ -114,6 +114,7 @@ jobs:
 
       - name: Cache alternate MetaTrader 5 terminal
         if: env.ALT_INSTALLER_URL != ''
+        continue-on-error: true
         id: mt5-alt-cache
         uses: actions/cache@v4
         with:
@@ -122,6 +123,7 @@ jobs:
 
       - name: Install alternate MetaTrader 5
         if: env.ALT_INSTALLER_URL != '' && steps.mt5-alt-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
         shell: pwsh
         run: |
           $setup = Join-Path $env:RUNNER_TEMP 'alt5setup.exe'
@@ -156,6 +158,7 @@ jobs:
 
       - name: Verify alternate terminal
         if: env.ALT_INSTALLER_URL != ''
+        continue-on-error: true
         shell: pwsh
         run: |
           if (!(Test-Path 'C:\mt5b\terminal64.exe')) { throw 'C:\mt5b\terminal64.exe is missing' }
