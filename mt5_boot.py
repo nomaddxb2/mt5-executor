@@ -98,6 +98,48 @@ def write_ini(creds):
     return path
 
 
+def boot_direct(creds):
+    login = int(creds.get("login"))
+    password = str(creds.get("password"))
+    server = str(creds.get("server"))
+    subprocess.run(["taskkill", "/F", "/IM", "terminal64.exe"], capture_output=True, text=True, timeout=25)
+    time.sleep(3)
+    deadline = time.time() + 180
+    last = None
+    while time.time() < deadline:
+        try:
+            ok = mt5.initialize(path=TERMINAL, login=login, password=password, server=server, timeout=60000, portable=True)
+        except Exception as exc:
+            ok = False
+            last = str(exc)
+        if ok:
+            ti = mt5.terminal_info()
+            ai = mt5.account_info()
+            out("direct terminal", ti)
+            out("direct account", ai)
+            if ai is not None and str(ai.login) == str(login):
+                out("session ready (direct)")
+                mt5.shutdown()
+                return 0
+            out("direct account mismatch", mt5.last_error())
+        else:
+            last = mt5.last_error()
+            out("direct initialize pending", last)
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        time.sleep(3)
+    out("direct boot failed", last)
+    try:
+        mt5.shutdown()
+    except Exception:
+        pass
+    subprocess.run(["taskkill", "/F", "/IM", "terminal64.exe"], capture_output=True, text=True, timeout=25)
+    time.sleep(3)
+    return 1
+
+
 def main():
     if not API or not SECRET:
         out("MT5_API_URL and MT5_WORKER_SECRET are required")
@@ -116,6 +158,8 @@ def main():
         out("account credentials incomplete")
         return 2
     out("login", creds.get("login"), "server", creds.get("server"))
+    if boot_direct(creds) == 0:
+        return 0
 
     subprocess.run(["taskkill", "/F", "/IM", "terminal64.exe"], capture_output=True, text=True, timeout=25)
     time.sleep(3)
