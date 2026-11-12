@@ -44,6 +44,7 @@ ZERO_STATS = {
     "trades": 0,
     "wins": 0,
     "losses": 0,
+    "breakeven": 0,
     "winRate": 0,
     "profitFactor": 0,
     "expectancy": 0,
@@ -210,6 +211,128 @@ def ensure_flip_sequence(fr: Dict[str, Any], up_to: int) -> List[float]:
 def flip_required_lot(target_usd: float, width: float, tick_value: float, tick_size: float) -> float:
     vpp = (float(tick_value) / float(tick_size)) if tick_size else 0.0
     return (float(target_usd) / (float(width) * vpp)) if width > 0 and vpp > 0 else 0.0
+
+
+def _usd_per_price(spec: Dict[str, Any]) -> float:
+    tick_value = float((spec or {}).get("tickValue") or 1.0)
+    tick_size = float((spec or {}).get("tickSize") or 0.00001)
+    return (tick_value / tick_size) if tick_size > 0 else 0.0
+
+
+def planned_profit(entry: float, take_profit: float, volume: float, spec: Dict[str, Any]) -> float:
+    vpp = _usd_per_price(spec)
+    if not entry or not take_profit or not volume or vpp <= 0:
+        return 0.0
+    return round(abs(float(take_profit) - float(entry)) * vpp * float(volume), 2)
+
+
+def trade_result(record: Dict[str, Any]) -> str:
+    raw = str(record.get("result") or "").strip().upper()
+    if raw in ("W", "WIN", "TP"):
+        return "W"
+    if raw in ("L", "LOSS", "SL"):
+        return "L"
+    if raw in ("BE", "BREAKEVEN", "FLAT"):
+        return "BE"
+    try:
+        pnl = float(record.get("pnl") or 0)
+    except (TypeError, ValueError):
+        pnl = 0.0
+    entry = float(record.get("entry") or record.get("openPrice") or 0)
+    close = float(record.get("closePrice") or 0)
+    tp = float(record.get("takeProfit") or record.get("tp") or 0)
+    risk = abs(float(record.get("riskAmount") or 0))
+    planned = abs(float(record.get("plannedProfit") or record.get("missedProfit") or 0))
+    price_tol = abs(tp - entry) * 0.03 if entry and tp else 0.0
+    be_tol = max(0.02, risk * 0.03, planned * 0.02)
+    near_entry = not tp or not (entry and close) or abs(close - entry) <= max(price_tol, 1e-9)
+    side = str(record.get("side") or "").lower()
+    reached = False
+    if entry and close and tp:
+        reached = close <= tp + max(price_tol, 1e-9) if side == "sell" else close >= tp - max(price_tol, 1e-9)
+    if pnl < 0:
+        return "BE" if abs(pnl) <= be_tol and near_entry else "L"
+    if pnl == 0:
+        return "BE"
+    if reached:
+        return "W"
+    return "BE" if abs(pnl) <= be_tol and near_entry else "W"
+
+
+def recovery_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    rec = state.setdefault("recovery", {})
+    rec.setdefault("active", False)
+    rec.setdefault("lossAmount", 0.0)
+    rec.setdefault("missedProfit", 0.0)
+    rec.setdefault("openProfit", 0.0)
+    rec.setdefault("targetUsd", 0.0)
+    rec.setdefault("losses", 0)
+    rec.setdefault("lastLossAt", None)
+    rec.setdefault("lastLossTicket", None)
+    rec.setdefault("lastLossPnl", 0.0)
+    rec.setdefault("updatedAt", None)
+    return rec
+
+
+def update_recovery(rec: Dict[str, Any], record: Dict[str, Any], open_profit: float = 0.0) -> None:
+    pnl = float(record.get("pnl") or 0)
+    result = trade_result(record)
+    if result == "L":
+        loss = abs(pnl)
+        missed = max(0.0, float(record.get("missedProfit") or record.get("plannedProfit") or 0))
+        rec["lossAmount"] = round(float(rec.get("lossAmount") or 0) + loss, 2)
+        rec["missedProfit"] = round(float(rec.get("missedProfit") or 0) + missed, 2)
+        rec["losses"] = int(rec.get("losses") or 0) + 1
+        rec["lastLossAt"] = record.get("closedAt") or _iso()
+        rec["lastLossTicket"] = record.get("ticket")
+        rec["lastLossPnl"] = round(pnl, 2)
+    elif result == "W" and pnl > 0:
+        credit = pnl
+        for key in ("lossAmount", "missedProfit"):
+            used = min(credit, float(rec.get(key) or 0))
+            rec[key] = round(float(rec.get(key) or 0) - used, 2)
+            credit = round(credit - used, 2)
+        if float(rec.get("lossAmount") or 0) <= 0 and float(rec.get("missedProfit") or 0) <= 0:
+            rec["losses"] = 0
+    rec["openProfit"] = round(max(0.0, float(open_profit or 0)), 2)
+    rec["targetUsd"] = round(float(rec.get("lossAmount") or 0) + float(rec.get("missedProfit") or 0) + float(rec.get("openProfit") or 0), 2)
+    rec["active"] = rec["targetUsd"] > 0.009
+    rec["updatedAt"] = _iso()
+
+
+def plan_recovery_entry(target_usd: float, price: float, sl_dist: float, tp_dist: float,
+                        spec: Dict[str, Any], equity: float, base_lots: float,
+                        atr: float = 0.0, risk_pct: float = 5.0) -> Dict[str, Any]:
+    target = max(0.0, float(target_usd or 0))
+    sl_dist = max(0.0, float(sl_dist or 0))
+    tp_dist = max(0.0, float(tp_dist or 0))
+    vpp = _usd_per_price(spec)
+    if target <= 0 or price <= 0 or sl_dist <= 0 or vpp <= 0:
+        return {"ok": False, "reason": "recovery_unreachable", "target": target}
+    vmin = max(0.01, float(spec.get("volumeMin") or 0.01))
+    vstep = max(0.01, float(spec.get("volumeStep") or 0.01))
+    vmax = max(vmin, float(spec.get("volumeMax") or vmin))
+    max_risk = max(0.0, float(equity or 0) * float(risk_pct or 5.0) / 100.0)
+    risk_lots = max_risk / (sl_dist * vpp) if sl_dist * vpp > 0 else 0.0
+    max_lots = min(vmax, risk_lots)
+    if max_lots < vmin:
+        return {"ok": False, "reason": "recovery_risk", "target": target, "riskLots": round(risk_lots, 4)}
+    if tp_dist <= 0:
+        tp_dist = max(sl_dist * 1.5, float(atr or 0.0) * 2.0, 0.0)
+    pay_lots = target / (tp_dist * vpp) if tp_dist * vpp > 0 else max_lots
+    lots = max(float(base_lots or 0.0), pay_lots, vmin)
+    lots = math.ceil((lots - 1e-9) / vstep) * vstep
+    lots = min(lots, max_lots)
+    lots = max(vmin, lots)
+    need_tp = target / (lots * vpp) if lots * vpp > 0 else tp_dist
+    max_tp = max(tp_dist, float(atr or 0.0) * 4.0, sl_dist * 2.0)
+    if need_tp > max_tp + 1e-9:
+        return {"ok": False, "reason": "recovery_unreachable", "target": target,
+                "requiredTp": round(need_tp, 5), "maxTp": round(max_tp, 5), "lots": round(lots, 4)}
+    final_tp = max(tp_dist, need_tp)
+    return {"ok": True, "lots": round(lots, 4), "tpDist": round(final_tp, 5),
+            "risk": round(sl_dist * vpp * lots, 2), "target": target,
+            "riskLots": round(risk_lots, 4), "maxTp": round(max_tp, 5)}
 
 
 def update_flip_pair(fr: Dict[str, Any], seq: List[float], symbol: str, pnl: float, side: str = "") -> None:
@@ -975,10 +1098,14 @@ def compute_stats(closed: List[Dict[str, Any]], starting_equity: float) -> Dict[
     if not closed:
         return dict(ZERO_STATS)
     pnls = [float(c.get("pnl") or 0) for c in closed]
-    wins = sum(1 for p in pnls if p > 0)
-    losses = sum(1 for p in pnls if p < 0)
-    gross_win = sum(p for p in pnls if p > 0)
-    gross_loss = abs(sum(p for p in pnls if p < 0))
+    results = [trade_result(c) for c in closed]
+    win_pnls = [p for p, r in zip(pnls, results) if r == "W"]
+    loss_pnls = [p for p, r in zip(pnls, results) if r == "L"]
+    wins = len(win_pnls)
+    losses = len(loss_pnls)
+    breakeven = sum(1 for r in results if r == "BE")
+    gross_win = sum(win_pnls)
+    gross_loss = abs(sum(loss_pnls))
     peak = float(starting_equity or 0)
     equity = peak
     max_dd = 0.0
@@ -988,11 +1115,13 @@ def compute_stats(closed: List[Dict[str, Any]], starting_equity: float) -> Dict[
         if peak > 0:
             max_dd = max(max_dd, (peak - equity) / peak * 100.0)
     rs = [float(c.get("r") or 0) for c in closed]
+    decided = wins + losses
     return {
         "trades": len(pnls),
         "wins": wins,
         "losses": losses,
-        "winRate": round(wins / len(pnls), 4) if pnls else 0,
+        "breakeven": breakeven,
+        "winRate": round(wins / decided, 4) if decided else 0,
         "profitFactor": round(gross_win / gross_loss, 3) if gross_loss > 1e-9 else (round(gross_win, 3) if gross_win else 0),
         "expectancy": round(sum(pnls) / len(pnls), 3),
         "maxDrawdownPct": round(max_dd, 2),
@@ -1006,6 +1135,7 @@ def build_trade_analytics(closed: List[Dict[str, Any]]) -> Dict[str, Any]:
             "symbols": [], "symbolStats": [], "topPairs": [], "bottomPairs": [], "bestPair": None, "worstPair": None,
             "sideStats": {}, "avgWin": 0, "avgLoss": 0, "payoff": 0,
             "largestWin": 0, "largestLoss": 0, "currentStreak": 0, "bestWinStreak": 0, "worstLossStreak": 0,
+            "wins": 0, "losses": 0, "breakeven": 0,
         }
     rows = sorted(closed, key=lambda r: str(r.get("closedAt") or ""))
     symbols: Dict[str, Dict[str, Any]] = {}
@@ -1017,6 +1147,7 @@ def build_trade_analytics(closed: List[Dict[str, Any]]) -> Dict[str, Any]:
             pnl = float(row.get("pnl") or 0)
         except (TypeError, ValueError):
             pnl = 0.0
+        result = trade_result(row)
         symbol = _base(row.get("symbol") or "?") or "?"
         side = "short" if str(row.get("side") or "").lower() == "sell" else "long"
         try:
@@ -1024,50 +1155,51 @@ def build_trade_analytics(closed: List[Dict[str, Any]]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             r_value = 0.0
         bucket = symbols.setdefault(symbol, {
-            "symbol": symbol, "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "r": 0.0,
+            "symbol": symbol, "trades": 0, "wins": 0, "losses": 0, "breakeven": 0, "pnl": 0.0, "r": 0.0,
             "long": 0, "short": 0, "grossWin": 0.0, "grossLoss": 0.0,
         })
         bucket["trades"] += 1
         bucket["pnl"] = round(float(bucket["pnl"]) + pnl, 2)
         bucket["r"] = round(float(bucket["r"]) + r_value, 3)
         bucket[side] += 1
-        if pnl > 0:
+        if result == "W":
             bucket["wins"] += 1
             bucket["grossWin"] = round(float(bucket["grossWin"]) + pnl, 2)
             wins.append(pnl)
-        elif pnl < 0:
+        elif result == "L":
             bucket["losses"] += 1
             bucket["grossLoss"] = round(float(bucket["grossLoss"]) + abs(pnl), 2)
             losses.append(abs(pnl))
-        side_bucket = sides.setdefault(side, {"side": side, "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0})
+        else:
+            bucket["breakeven"] += 1
+        side_bucket = sides.setdefault(side, {"side": side, "trades": 0, "wins": 0, "losses": 0, "breakeven": 0, "pnl": 0.0})
         side_bucket["trades"] += 1
         side_bucket["pnl"] = round(float(side_bucket["pnl"]) + pnl, 2)
-        if pnl > 0:
+        if result == "W":
             side_bucket["wins"] += 1
-        elif pnl < 0:
+        elif result == "L":
             side_bucket["losses"] += 1
+        else:
+            side_bucket["breakeven"] += 1
 
     pair_rows = []
     for bucket in symbols.values():
-        trades = int(bucket["trades"])
-        bucket["winRate"] = round(bucket["wins"] / trades, 4) if trades else 0
-        bucket["avgR"] = round(float(bucket["r"]) / trades, 3) if trades else 0
+        decided = int(bucket["wins"]) + int(bucket["losses"])
+        bucket["winRate"] = round(bucket["wins"] / decided, 4) if decided else 0
+        bucket["avgR"] = round(float(bucket["r"]) / int(bucket["trades"]), 3) if bucket["trades"] else 0
         bucket["profitFactor"] = round(float(bucket["grossWin"]) / float(bucket["grossLoss"]), 3) if bucket["grossLoss"] else (round(float(bucket["grossWin"]), 3) if bucket["grossWin"] else 0)
         pair_rows.append(bucket)
     pair_rows.sort(key=lambda r: (float(r.get("pnl") or 0), int(r.get("wins") or 0)), reverse=True)
     for bucket in sides.values():
-        trades = int(bucket["trades"])
-        bucket["winRate"] = round(bucket["wins"] / trades, 4) if trades else 0
+        decided = int(bucket["wins"]) + int(bucket["losses"])
+        bucket["winRate"] = round(bucket["wins"] / decided, 4) if decided else 0
     current = best_win = worst_loss = 0
     for row in rows:
-        try:
-            pnl = float(row.get("pnl") or 0)
-        except (TypeError, ValueError):
-            pnl = 0.0
-        if pnl > 0:
+        result = trade_result(row)
+        if result == "W":
             current = current + 1 if current > 0 else 1
             best_win = max(best_win, current)
-        elif pnl < 0:
+        elif result == "L":
             current = current - 1 if current < 0 else -1
             worst_loss = min(worst_loss, current)
         else:
@@ -1091,8 +1223,10 @@ def build_trade_analytics(closed: List[Dict[str, Any]]) -> Dict[str, Any]:
         "currentStreak": current,
         "bestWinStreak": best_win,
         "worstLossStreak": abs(worst_loss),
+        "wins": len(wins),
+        "losses": len(losses),
+        "breakeven": sum(1 for r in rows if trade_result(r) == "BE"),
     }
-
 
 def initial_state() -> Dict[str, Any]:
     return {
@@ -1136,6 +1270,12 @@ def initial_state() -> Dict[str, Any]:
             "deficit": 0.0, "missedProfit": 0.0,
             "sequence": [0.01, 0.02, 0.04, 0.08, 0.16, 0.32],
             "pairs": {},
+        },
+        "recovery": {
+            "active": False, "lossAmount": 0.0, "missedProfit": 0.0,
+            "openProfit": 0.0, "targetUsd": 0.0, "losses": 0,
+            "lastLossAt": None, "lastLossTicket": None, "lastLossPnl": 0.0,
+            "updatedAt": None,
         },
         "komz": {
             "name": "Komz",
@@ -1525,18 +1665,20 @@ class AIAgent:
                     float(row.get("winRate") or 0) * 100.0,
                     float(row.get("profitFactor") or 0),
                 ))
-                lines.append("   ✅ %dW · ❌ %dL · 📊 %d trades · 📌 %d open" % (
+                lines.append("   ✅ %dW · ❌ %dL · ⚪ %dBE · 📊 %d trades · 📌 %d open" % (
                     int(row.get("wins") or 0),
                     int(row.get("losses") or 0),
+                    int(row.get("breakeven") or 0),
                     int(row.get("trades") or 0),
                     int(row.get("positions") or 0),
                 ))
                 if best.get("symbol"):
-                    lines.append("   🏆 Best pair: %s %+.2f · %dW/%dL" % (
+                    lines.append("   🏆 Best pair: %s %+.2f · %dW/%dL/%dBE" % (
                         best.get("symbol"),
                         float(best.get("pnl") or 0),
                         int(best.get("wins") or 0),
                         int(best.get("losses") or 0),
+                        int(best.get("breakeven") or 0),
                     ))
                 lines.append("")
             self._arena_notify(account_id, "leaderboard", "\n".join(lines))
@@ -1561,23 +1703,25 @@ class AIAgent:
                 streak_text = ("🔥 %dW" % current) if current > 0 else (("🧊 %dL" % abs(current)) if current < 0 else "➖ flat")
                 lines.append("%s %s" % (medals.get(int(row.get("rank") or 0), "•"), row.get("name") or "model"))
                 if best.get("symbol"):
-                    lines.append("   🏆 Best pair: %s %+.2f · %dW/%dL · %.0f%% win" % (
+                    lines.append("   🏆 Best pair: %s %+.2f · %dW/%dL/%dBE · %.0f%% win" % (
                         best.get("symbol"), float(best.get("pnl") or 0),
                         int(best.get("wins") or 0), int(best.get("losses") or 0),
+                        int(best.get("breakeven") or 0),
                         float(best.get("winRate") or 0) * 100.0,
                     ))
                 if worst.get("symbol"):
-                    lines.append("   ⚠️ Weakest: %s %+.2f · %dW/%dL" % (
+                    lines.append("   ⚠️ Weakest: %s %+.2f · %dW/%dL/%dBE" % (
                         worst.get("symbol"), float(worst.get("pnl") or 0),
                         int(worst.get("wins") or 0), int(worst.get("losses") or 0),
+                        int(worst.get("breakeven") or 0),
                     ))
-                lines.append("   🟢 Long %d · %dW/%dL · %+.2f" % (
+                lines.append("   🟢 Long %d · %dW/%dL/%dBE · %+.2f" % (
                     int(long.get("trades") or 0), int(long.get("wins") or 0),
-                    int(long.get("losses") or 0), float(long.get("pnl") or 0),
+                    int(long.get("losses") or 0), int(long.get("breakeven") or 0), float(long.get("pnl") or 0),
                 ))
-                lines.append("   🔴 Short %d · %dW/%dL · %+.2f" % (
+                lines.append("   🔴 Short %d · %dW/%dL/%dBE · %+.2f" % (
                     int(short.get("trades") or 0), int(short.get("wins") or 0),
-                    int(short.get("losses") or 0), float(short.get("pnl") or 0),
+                    int(short.get("losses") or 0), int(short.get("breakeven") or 0), float(short.get("pnl") or 0),
                 ))
                 lines.append("   📊 Avg win %+.2f · avg loss %+.2f · 💪 payoff %.2fx" % (
                     float(row.get("avgWin") or 0), -abs(float(row.get("avgLoss") or 0)),
@@ -1775,6 +1919,7 @@ class AIAgent:
                 "trades": int(stats.get("trades") or 0),
                 "wins": int(stats.get("wins") or 0),
                 "losses": int(stats.get("losses") or 0),
+                "breakeven": int(stats.get("breakeven") or 0),
                 "pnl": realized,
                 "source": "mt5",
                 "asOf": _iso(),
@@ -1822,6 +1967,7 @@ class AIAgent:
                 "trades": int(stats.get("trades") or 0),
                 "wins": int(stats.get("wins") or 0),
                 "losses": int(stats.get("losses") or 0),
+                "breakeven": int(stats.get("breakeven") or 0),
                 "realizedPnl": round(float(realized), 2),
                 "winRate": float(stats.get("winRate") or 0),
                 "profitFactor": float(stats.get("profitFactor") or 0),
@@ -1838,6 +1984,8 @@ class AIAgent:
                     "bestWin": int(analytics.get("bestWinStreak") or 0),
                     "worstLoss": int(analytics.get("worstLossStreak") or 0),
                 },
+                "recovery": s.get("recovery") or {},
+                "recoveryActive": bool((s.get("recovery") or {}).get("active")),
                 "positions": len(s.get("positions") or []),
                 "cycle": int(s.get("cycle") or 0),
                 "running": bool(s.get("running")),
@@ -1893,6 +2041,7 @@ class AIAgent:
         state.setdefault("closed", [])
         state.setdefault("decisions", [])
         state.setdefault("thoughts", [])
+        recovery_state(state)
         loss = state.setdefault("lossCounts", {"buy": 0, "sell": 0})
         for side in ("buy", "sell"):
             try:
@@ -1986,16 +2135,20 @@ class AIAgent:
                 "modelName": state.get("modelName") or MQL5_105_SPEC["name"],
                 "source": "mt5",
             })
+            record["result"] = trade_result(record)
             rows = [c for c in (state.get("closed") or []) if str(c.get("ticket")) != str(ticket)]
             rows.append(record)
             state["closed"] = rows[-200:]
+            update_recovery(recovery_state(state), record, 0.0)
             self._arena_notify(account_id, "trade", (
                 "🔴 105 CLOSE\n"
+                "🏁 %s\n"
                 "🧠 %s\n"
                 "📉 %s %s %.2f\n"
                 "💰 P/L %+.2f\n"
                 "🏷 magic %s · #%s"
             ) % (
+                record.get("result") or "BE",
                 state.get("modelName") or MQL5_105_SPEC["name"],
                 record.get("symbol"),
                 str(record.get("side") or "").upper(),
@@ -2008,6 +2161,16 @@ class AIAgent:
         if not own and bid > 0 and ask > 0:
             buy_lot = calc_lot(loss["buy"])
             sell_lot = calc_lot(loss["sell"])
+            rec = recovery_state(state)
+            if rec.get("active"):
+                target_side = float(rec.get("targetUsd") or 0) / 2.0
+                vpp = _usd_per_price(spec)
+                if target_side > 0 and vpp > 0 and sl_dist > 0:
+                    target_lot = target_side / (sl_dist * 2.0 * vpp)
+                    risk_lot = (equity * 0.05) / (sl_dist * vpp) if equity else target_lot
+                    sized = normal_lot(min(target_lot, risk_lot))
+                    buy_lot = max(buy_lot, sized)
+                    sell_lot = max(sell_lot, sized)
             for side, lot, price, stop in (
                 ("buy", buy_lot, ask, ask - sl_dist),
                 ("sell", sell_lot, bid, bid + sl_dist),
@@ -2187,6 +2350,7 @@ class AIAgent:
         state.setdefault("lastTradeAt", {})
         state.setdefault("lastHoldAt", {})
         state.setdefault("lastRiskHoldAt", {})
+        recovery_state(state)
         if model and not state.get("weightsInitialized"):
             state["weights"] = dict(model.get("weights") or DEFAULT_WEIGHTS)
             state["weightsInitialized"] = True
@@ -2447,16 +2611,23 @@ class AIAgent:
                 "pattern": old.get("pattern"),
                 "patternScore": old.get("patternScore"),
                 "flip": bool(old.get("flip", flip)),
+                "plannedProfit": round(float(old.get("plannedProfit") or old.get("missedProfit") or 0), 2),
+                "missedProfit": round(float(old.get("plannedProfit") or old.get("missedProfit") or 0), 2),
+                "recovery": bool(old.get("recovery")),
+                "recoveryTarget": round(float(old.get("recoveryTarget") or 0), 2),
             }
+            record["result"] = trade_result(record)
             self._attach_setup(creds, account_id, record)
             closed_now.append(record)
             state["closed"].append(record)
             state["closed"] = state["closed"][-100:]
+            open_profit = sum(max(0.0, float(p.get("profit") or 0)) for p in ai_positions if str(p.get("ticket")) != str(old.get("ticket")))
+            update_recovery(recovery_state(state), record, open_profit)
             if flip and old.get("flip", True):
                 update_flip_pair(fr, seq, old.get("symbol"), float(record.get("pnl") or 0), old.get("side"))
             for dec in reversed(state["decisions"]):
                 if str(dec.get("ticket")) == str(old.get("ticket")):
-                    dec["outcome"] = "win" if pnl > 0 else "loss" if pnl < 0 else "flat"
+                    dec["outcome"] = {"W": "win", "L": "loss", "BE": "be"}.get(record["result"], "flat")
                     dec["pnl"] = round(pnl, 2)
                     break
             state["decisions"].append({
@@ -2470,20 +2641,21 @@ class AIAgent:
                 "volume": old.get("volume"),
                 "reason": "Position closed at %.2f (%+.2fR). %s" % (pnl, reward, "Learning weights updated." if reward else ""),
                 "ticket": old.get("ticket"),
-                "outcome": "win" if pnl > 0 else "loss" if pnl < 0 else "flat",
+                "outcome": {"W": "win", "L": "loss", "BE": "be"}.get(record["result"], "flat"),
                 "pnl": round(pnl, 2),
             })
 
         for rec in closed_now:
             self._arena_notify(account_id, "trade", (
-                "%s TRADE CLOSED\n"
+                "%s TRADE CLOSED · %s\n"
                 "⚔️ %s · %s\n"
                 "📉 %s %s %.2f lots\n"
                 "💵 P/L %+.2f · %+.2fR\n"
                 "🏷 magic %s · #%s\n"
                 "💬 %s"
             ) % (
-                "💰" if float(rec.get("pnl") or 0) > 0 else "🔻" if float(rec.get("pnl") or 0) < 0 else "⚪",
+                "💰" if rec.get("result") == "W" else "🔻" if rec.get("result") == "L" else "⚪",
+                rec.get("result") or "BE",
                 state.get("modelName") or "AI model",
                 state.get("modelRole") or "AI",
                 rec.get("symbol") or "—",
@@ -2541,6 +2713,9 @@ class AIAgent:
             entry["riskAtr"] = old.get("riskAtr")
             entry["timeframe"] = old.get("timeframe")
             entry["beMoved"] = bool(old.get("beMoved"))
+            entry["plannedProfit"] = old.get("plannedProfit") or old.get("missedProfit") or 0
+            entry["recovery"] = bool(old.get("recovery"))
+            entry["recoveryTarget"] = old.get("recoveryTarget") or 0
             if not dry and flip and float(pos.get("takeProfit") or 0) > 0:
                 try:
                     with self._locked():
@@ -2585,10 +2760,17 @@ class AIAgent:
                           "riskAmount": risk_amount,
                           "modelName": state.get("modelName") or state.get("modelId") or "AI model",
                           "reason": close_reason,
-                          "pattern": entry.get("pattern") or old.get("pattern"), "patternScore": entry.get("patternScore") or old.get("patternScore")}
+                          "pattern": entry.get("pattern") or old.get("pattern"), "patternScore": entry.get("patternScore") or old.get("patternScore"),
+                          "plannedProfit": round(float(entry.get("plannedProfit") or old.get("plannedProfit") or 0), 2),
+                          "missedProfit": round(float(entry.get("plannedProfit") or old.get("plannedProfit") or 0), 2),
+                          "recovery": bool(entry.get("recovery") or old.get("recovery")),
+                          "recoveryTarget": round(float(entry.get("recoveryTarget") or old.get("recoveryTarget") or 0), 2)}
+                record["result"] = trade_result(record)
                 self._attach_setup(creds, account_id, record)
                 state["closed"].append(record)
                 state["closed"] = state["closed"][-100:]
+                open_profit = sum(max(0.0, float(p.get("profit") or 0)) for p in ai_positions if str(p.get("ticket")) != str(pos.get("ticket")))
+                update_recovery(recovery_state(state), record, open_profit)
                 if flip and entry.get("flip", True):
                     update_flip_pair(fr, seq, pos.get("symbol"), pnl, side)
                 state["decisions"].append({
@@ -2596,7 +2778,7 @@ class AIAgent:
                     "symbol": pos.get("symbol"), "side": side, "confidence": float(row.get("confidence") or 0),
                     "price": price, "volume": pos.get("volume"),
                     "reason": "%s · locked %+.2fR." % (close_reason, reward),
-                    "ticket": pos.get("ticket"), "outcome": "win" if pnl > 0 else "loss" if pnl < 0 else "flat",
+                    "ticket": pos.get("ticket"), "outcome": {"W": "win", "L": "loss", "BE": "be"}.get(record["result"], "flat"),
                     "pnl": round(pnl, 2),
                 })
                 continue
@@ -2709,12 +2891,19 @@ class AIAgent:
                 guard_pnl = sum(float(c.get("pnl") or 0) for c in state["closed"] if str(c.get("closedAt", "")) >= since)
         state["todayPnl"] = round(today_pnl, 2)
         state["guardPnl"] = round(guard_pnl, 2)
+        rec = recovery_state(state)
+        open_profit = sum(max(0.0, float(p.get("profit") or 0)) for p in (state.get("positions") or []))
+        rec["openProfit"] = round(open_profit, 2)
+        rec["targetUsd"] = round(float(rec.get("lossAmount") or 0) + float(rec.get("missedProfit") or 0) + open_profit, 2)
+        rec["active"] = rec["targetUsd"] > 0.009
+        recovery_active = bool(rec.get("active"))
         loss_limit = -abs(equity * float(params.get("maxDailyLossPct", 3)) / 100.0)
         halted = bool(equity and guard_pnl <= loss_limit)
-        if flip:
+        if flip or recovery_active:
             halted = False
         state["halted"] = halted
-        cooldown_until = 0.0 if flip else float(state.get("cooldownUntil") or 0)
+        state["recoveryActive"] = recovery_active
+        cooldown_until = 0.0 if (flip or recovery_active) else float(state.get("cooldownUntil") or 0)
 
         peak = max(float(state.get("peakEquity") or equity or 0), float(equity or 0))
         state["peakEquity"] = peak
@@ -2726,7 +2915,9 @@ class AIAgent:
             risk_mult = 0.5
         elif drawdown_pct >= 2.5:
             risk_mult = 0.75
-        if flip:
+        if recovery_active:
+            risk_mult = 1.0
+        elif flip:
             base_risk = max(float(params.get("riskPct", 1.5)), 0.1)
             if drawdown_pct >= 10.0:
                 risk_mult = min(1.33, 2.0 / base_risk)
@@ -2737,18 +2928,23 @@ class AIAgent:
             else:
                 risk_mult = 1.0
         komz_state["recovery"] = {
-            "active": bool(flip and drawdown_pct > 0) or risk_mult < 1.0,
-            "mode": "recovery" if flip and drawdown_pct > 0 else "protect",
+            "active": bool(recovery_active or flip and drawdown_pct > 0 or risk_mult < 1.0),
+            "mode": "recovery" if recovery_active else "protect" if risk_mult < 1.0 else "normal",
             "drawdownPct": round(drawdown_pct, 2),
             "riskMultiplier": risk_mult,
             "peakEquity": round(peak, 2),
             "targetEquity": round(peak, 2),
             "flipOverride": bool(flip),
+            "lossAmount": round(float(rec.get("lossAmount") or 0), 2),
+            "missedProfit": round(float(rec.get("missedProfit") or 0), 2),
+            "openProfit": round(float(rec.get("openProfit") or 0), 2),
+            "targetUsd": round(float(rec.get("targetUsd") or 0), 2),
+            "losses": int(rec.get("losses") or 0),
+            "lastLossAt": rec.get("lastLossAt"),
+            "lastLossTicket": rec.get("lastLossTicket"),
             "lot": float(fr.get("lot") or 0.01),
             "step": int(fr.get("step") or 0),
             "deficit": round(float(fr.get("deficit") or 0), 2),
-            "missedProfit": round(float(fr.get("missedProfit") or 0), 2),
-            "targetProfit": round(float(fr.get("deficit") or 0) + float(fr.get("missedProfit") or 0), 2),
             "sequence": list(seq),
             "pairs": {k: {"lot": float(v.get("lot") or 0.01), "step": int(v.get("step") or 0), "deficit": round(float(v.get("deficit") or 0), 2)} for k, v in (fr.get("pairs") or {}).items()},
         }
@@ -2862,7 +3058,8 @@ class AIAgent:
                         continue
                     deficit = float(pair.get("deficit") or 0)
                     missed = float(pair.get("missedProfit") or fr.get("missedProfit") or 0.0)
-                    target_usd = max(missed, deficit + missed)
+                    target_usd = max(missed, deficit) + open_profit
+                    recovery_target_usd = target_usd
                     tick_value = float(spec.get("tickValue") or 1.0)
                     tick_size = float(spec.get("tickSize") or 0.00001)
                     required_lot = flip_required_lot(target_usd, max(0.7 * atr_v, 1e-9), tick_value, tick_size) if deficit > 0 else 0.0
@@ -2951,6 +3148,9 @@ class AIAgent:
                         "tpArmed": False, "openedAt": _iso(),
                         "reason": "Flip hedge %s: SL %.5f near opposite TP, virtual TP %.5f." % (side.upper(), sl, target_tp),
                         "contributions": {}, "riskAmount": actual_risk, "flip": True, "hedge": True, "pairKey": pair_key,
+                        "plannedProfit": planned_profit(fill, target_tp, lots, spec),
+                        "missedProfit": planned_profit(fill, target_tp, lots, spec),
+                        "recovery": bool(recovery_active), "recoveryTarget": round(float(recovery_target_usd or 0), 2),
                     })
                     state["decisions"].append({
                         "id": "ho%d" % int(time.time() * 1000), "at": _iso(), "action": side,
@@ -3016,7 +3216,7 @@ class AIAgent:
             if now - last_at < float(params.get("cooldownSec", 180)):
                 continue
             if profit:
-                if loss_streak >= 2 or today_trades >= 4:
+                if not recovery_active and (loss_streak >= 2 or today_trades >= 4):
                     break
                 if not cand.get("validatedPattern"):
                     continue
@@ -3046,6 +3246,31 @@ class AIAgent:
             sl = float(cand.get("sl") or 0)
             sl_dist = abs(price - sl)
             lots = position_size(equity, risk_pct, sl_dist, spec)
+            recovery_target_usd = 0.0
+            if recovery_active and not flip:
+                atr_v = float(cand.get("atr") or 0)
+                tp_dist = abs(float(cand.get("tp") or price) - price)
+                if tp_dist <= 0:
+                    tp_dist = max(atr_v * float(params.get("atrTp") or 2.0), sl_dist * 1.5)
+                plan = plan_recovery_entry(float(rec.get("targetUsd") or 0), price, sl_dist, tp_dist, spec, equity, lots, atr_v)
+                if not plan.get("ok"):
+                    key = "%s:recovery" % _base(sym)
+                    last_note = float((state.get("lastRiskHoldAt") or {}).get(key) or 0)
+                    if now - last_note > 120:
+                        state["decisions"].append({
+                            "id": "rv%d" % int(time.time() * 1000), "at": _iso(), "action": "hold",
+                            "symbol": sym, "side": None, "confidence": cand.get("confidence"),
+                            "price": price, "volume": None,
+                            "reason": "Recovery target $%.2f cannot be reached within %.1f%% risk: %s." % (
+                                float(rec.get("targetUsd") or 0), 5.0, plan.get("reason") or "unreachable"),
+                        })
+                        state.setdefault("lastRiskHoldAt", {})[key] = now
+                    continue
+                lots = float(plan["lots"])
+                recovery_target_usd = float(rec.get("targetUsd") or 0)
+                tp_dist = float(plan["tpDist"])
+                cand["tp"] = price + tp_dist if str(cand.get("side") or "").lower() == "buy" else price - tp_dist
+                cand["recovery"] = True
             if flip:
                 base_sym = _base(sym)
                 side_key = str(cand.get("side") or "").upper()
@@ -3062,7 +3287,8 @@ class AIAgent:
                 base_tp_dist = max(0.7 * atr_v, abs(price - float(cand.get("tp") or price)))
                 deficit = float(pair.get("deficit") or 0)
                 missed = float(pair.get("missedProfit") or fr.get("missedProfit") or 0.0)
-                target_usd = max(missed, deficit + missed)
+                target_usd = max(missed, deficit) + open_profit
+                recovery_target_usd = target_usd
                 tick_value = float(spec.get("tickValue") or 1.0)
                 tick_size = float(spec.get("tickSize") or 0.00001)
                 required_lot = flip_required_lot(target_usd, base_tp_dist, tick_value, tick_size) if deficit > 0 else 0.0
@@ -3088,7 +3314,7 @@ class AIAgent:
             tick_size = float(spec.get("tickSize") or 0.00001)
             risk_per_lot = sl_dist * (tick_value / tick_size) if tick_size else sl_dist * 100000.0
             actual_risk = risk_per_lot * lots
-            risk_cap = max(0.0, equity * (0.05 if flip else 0.02))
+            risk_cap = max(0.0, equity * (0.05 if (flip or recovery_active) else 0.02))
             if actual_risk > risk_cap:
                 last_risk = float((state.get("lastRiskHoldAt") or {}).get(sym) or 0)
                 if now - last_risk > 300:
@@ -3097,7 +3323,7 @@ class AIAgent:
                         "symbol": sym, "side": None, "confidence": cand.get("confidence"),
                         "price": price, "volume": lots,
                         "reason": "Min-lot risk $%.2f is %.1f%% of equity, above the %.1f%% cap. Skipping %s." % (
-                            actual_risk, (actual_risk / equity * 100.0) if equity else 0, 5.0 if flip else 2.0, sym),
+                            actual_risk, (actual_risk / equity * 100.0) if equity else 0, 5.0 if (flip or recovery_active) else 2.0, sym),
                     })
                     state.setdefault("lastRiskHoldAt", {})[sym] = now
                 continue
@@ -3265,6 +3491,7 @@ class AIAgent:
                 "ticket": ticket, "outcome": None, "pnl": None,
             }
             state["decisions"].append(decision)
+            planned = planned_profit(fill, float(cand.get("tp") or 0), lots, spec)
             state["positions"].append({
                 "ticket": ticket, "symbol": sym, "side": cand.get("side"), "volume": lots,
                 "openPrice": fill, "currentPrice": fill, "profit": 0, "sl": cand.get("sl"),
@@ -3274,7 +3501,8 @@ class AIAgent:
                 "decisionId": decision["id"], "flip": bool(flip),
                 "pattern": cand.get("patternName"), "patternScore": cand.get("patternScore"),
                 "timeStopHours": cand.get("timeStopHours"), "timeframe": cand.get("timeframe"),
-                "riskAtr": cand.get("riskAtr"),
+                "riskAtr": cand.get("riskAtr"), "plannedProfit": planned, "missedProfit": planned,
+                "recovery": bool(recovery_active), "recoveryTarget": round(float(recovery_target_usd or 0), 2),
             })
             self._arena_notify(account_id, "trade", (
                 "🟢 TRADE OPEN\n"
