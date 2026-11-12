@@ -1,0 +1,43 @@
+name: telegram-relay
+on:
+  repository_dispatch:
+    types: [telegram-result]
+permissions:
+  contents: read
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Send Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEXT: ${{ github.event.client_payload.text }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat = os.environ.get("TELEGRAM_CHAT_ID", "")
+          text = os.environ.get("TEXT", "")
+          if not token or not chat:
+              raise SystemExit("telegram secrets not configured")
+          if not text:
+              raise SystemExit("empty telegram text")
+          data = json.dumps({"chat_id": chat, "text": text[:3900], "disable_web_page_preview": True}).encode()
+          req = urllib.request.Request(
+              "https://api.telegram.org/bot%s/sendMessage" % token,
+              data=data,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              body = json.loads(resp.read().decode())
+          if not body.get("ok"):
+              raise SystemExit("telegram rejected: %s" % body)
+          print("telegram sent message_id=%s" % body.get("result", {}).get("message_id"))
+          PY
