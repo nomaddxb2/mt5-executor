@@ -114,6 +114,37 @@ BEST_TRADER_SPEC = {
 }
 
 
+MQL5_105_SPEC = {
+    "id": "mq5-105",
+    "name": "Kagujje HFT V58 · 105",
+    "role": "MQL5 HFT",
+    "lens": "105.mq5 · dual cross + trail",
+    "kind": "mq5-105",
+    "aiModel": None,
+    "useBrain": False,
+    "magic": 786910,
+    "config": {
+        "enabled": True,
+        "mode": "hft",
+        "symbols": ["GOLD_mini"],
+        "focusSymbols": ["GOLD_mini"],
+        "baseLot": 0.01,
+        "slPoints": 4000,
+        "trailPoints": 500,
+        "securePoints": 100,
+        "maxPositions": 2,
+        "riskPct": 0.0,
+        "maxDailyLossPct": 0.0,
+        "dryRun": False,
+        "komz": False,
+        "flipMode": False,
+        "cooldownSec": 0,
+        "timeStopHours": 0,
+        "maxSpreadAtr": 0.0,
+    },
+}
+
+
 def _trade_comment(text: Any, fallback: str = "AI") -> str:
     raw = " ".join(str(text or "").split())
     raw = raw.replace("·", "-").replace("|", "-").replace("/", "-")
@@ -1195,7 +1226,7 @@ class AIAgent:
             discovered = [{"id": self.brain.model, "label": str(self.brain.model).split("/")[-1], "role": "Portfolio Chair", "lens": "balanced"}]
         specs: List[Dict[str, Any]] = []
         seen = set()
-        used_magics = {int(BEST_TRADER_SPEC["magic"])}
+        used_magics = {int(BEST_TRADER_SPEC["magic"]), int(MQL5_105_SPEC["magic"])}
         for model in ((arena or {}).get("models") or {}).values():
             if model.get("magic"):
                 used_magics.add(int(model["magic"]))
@@ -1256,7 +1287,7 @@ class AIAgent:
         known = {str(spec["id"]) for spec in specs}
         for model in ((arena or {}).get("models") or {}).values():
             mid = str(model.get("id") or "")
-            if not mid or mid in known or mid == BEST_TRADER_SPEC["id"]:
+            if not mid or mid in known or mid in (BEST_TRADER_SPEC["id"], MQL5_105_SPEC["id"]):
                 continue
             specs.append({
                 "id": mid,
@@ -1281,6 +1312,18 @@ class AIAgent:
             "magic": BEST_TRADER_SPEC["magic"],
             "weights": {"trend": 0.55, "momentum": 0.15, "breakout": 0.25, "meanrev": 0.05},
             "config": dict(BEST_TRADER_SPEC["config"]),
+        })
+        specs.append({
+            "id": MQL5_105_SPEC["id"],
+            "name": MQL5_105_SPEC["name"],
+            "role": MQL5_105_SPEC["role"],
+            "lens": MQL5_105_SPEC["lens"],
+            "kind": MQL5_105_SPEC["kind"],
+            "aiModel": None,
+            "useBrain": False,
+            "magic": MQL5_105_SPEC["magic"],
+            "weights": dict(DEFAULT_WEIGHTS),
+            "config": dict(MQL5_105_SPEC["config"]),
         })
         return specs
 
@@ -1429,7 +1472,10 @@ class AIAgent:
             model["state"] = mstate
             arena["models"][spec["id"]] = model
             try:
-                self.run_account(row_for_model, model=model, post=lambda s, m=model: self._arena_save(state, m, s))
+                if spec["kind"] == "mq5-105":
+                    self._run_105(row_for_model, model=model, post=lambda s, m=model: self._arena_save(state, m, s))
+                else:
+                    self.run_account(row_for_model, model=model, post=lambda s, m=model: self._arena_save(state, m, s))
             except Exception as e:
                 mstate["error"] = str(e)
                 mstate["running"] = False
@@ -1819,6 +1865,307 @@ class AIAgent:
         state["error"] = str(error)
         state["running"] = False
         self._post(row.get("accountId"), state)
+
+    def _run_105(self, row: Dict[str, Any], model: Optional[Dict[str, Any]] = None, post=None) -> None:
+        cfg = (model or {}).get("config") or row.get("config") or dict(MQL5_105_SPEC["config"])
+        creds = row.get("credentials") or {}
+        account_id = row.get("accountId")
+        if not account_id or not creds or not cfg.get("enabled"):
+            return
+        state = (model or {}).get("state")
+        if not isinstance(state, dict):
+            state = initial_state()
+        if model:
+            state["modelId"] = str(model.get("id") or MQL5_105_SPEC["id"])
+            state["modelName"] = model.get("name") or MQL5_105_SPEC["name"]
+            state["modelRole"] = model.get("role") or MQL5_105_SPEC["role"]
+            state["modelKind"] = "mq5-105"
+            state["aiModel"] = None
+        magic = int((model or {}).get("magic") or cfg.get("magic") or MQL5_105_SPEC["magic"])
+        state["magic"] = magic
+        symbol = str((cfg.get("symbols") or MQL5_105_SPEC["config"]["symbols"])[0])
+        base_lot = float(cfg.get("baseLot") or 0.01)
+        sl_points = int(cfg.get("slPoints") or 4000)
+        trail_points = int(cfg.get("trailPoints") or 500)
+        secure_points = int(cfg.get("securePoints") or 100)
+        dry = bool(cfg.get("dryRun"))
+        state.setdefault("positions", [])
+        state.setdefault("closed", [])
+        state.setdefault("decisions", [])
+        state.setdefault("thoughts", [])
+        loss = state.setdefault("lossCounts", {"buy": 0, "sell": 0})
+        for side in ("buy", "sell"):
+            try:
+                loss[side] = int(loss.get(side) or 0)
+            except Exception:
+                loss[side] = 0
+
+        try:
+            with self._locked():
+                self.pool.connect(creds)
+                info = self.pool.account(creds) or {}
+                spec = self.pool.spec(creds, symbol) or {}
+                broker_symbol = str(spec.get("symbol") or symbol)
+                all_positions = self.pool.positions(creds) or []
+                quote_rows = self.pool.prices(creds, [symbol]).get("prices") or []
+        except Exception as e:
+            state["error"] = "105 read failed: %s" % e
+            state["running"] = False
+            state["updatedAt"] = _iso()
+            if post:
+                post(state)
+            else:
+                self._post(account_id, state)
+            return
+
+        own = [
+            p for p in all_positions
+            if int(p.get("magic") or 0) == magic
+            and str(p.get("symbol") or "").upper() == broker_symbol.upper()
+        ]
+        quote = quote_rows[0] if quote_rows else {}
+        bid = float(quote.get("bid") or 0)
+        ask = float(quote.get("ask") or 0)
+        point = float(spec.get("point") or 0.001)
+        digits = int(spec.get("digits") or 3)
+        vmin = float(spec.get("volumeMin") or 0.01)
+        vmax = float(spec.get("volumeMax") or 100.0)
+        vstep = float(spec.get("volumeStep") or 0.01)
+        min_stop = max(0.0, int(spec.get("stopsLevel") or 0) * point)
+        sl_dist = max(sl_points * point, min_stop)
+        trail_dist = max(trail_points * point, min_stop)
+        secure_dist = max(secure_points * point, min_stop)
+        equity = float(info.get("equity") or info.get("balance") or 0)
+        if not state.get("startingEquity"):
+            state["startingEquity"] = equity
+        state["balance"] = float(info.get("balance") or 0)
+        state["equity"] = equity
+        state["mode"] = "dry-run" if dry else "live"
+        state["running"] = True
+        state["error"] = None
+        state["cycle"] = int(state.get("cycle") or 0) + 1
+
+        def normal_lot(value: float) -> float:
+            lot = max(vmin, min(vmax, float(value)))
+            if vstep > 0:
+                lot = round(round(lot / vstep) * vstep, 8)
+            return max(vmin, min(vmax, lot))
+
+        def calc_lot(count: int) -> float:
+            if count <= 0:
+                lot = base_lot
+            else:
+                lot = base_lot * 2.0 + count * 0.01
+            return normal_lot(lot)
+
+        current = {str(p.get("ticket")): p for p in own}
+        previous = {str(p.get("ticket")): p for p in (state.get("positions") or []) if p.get("ticket")}
+        for ticket, old in previous.items():
+            if ticket in current:
+                continue
+            record = dict(old)
+            deal = {}
+            try:
+                with self._locked():
+                    deal = self.pool.deal_result(creds, ticket) or {}
+            except Exception:
+                deal = {}
+            pnl = deal.get("profit")
+            if pnl is None:
+                pnl = old.get("profit") or 0
+            record.update({
+                "ticket": ticket,
+                "symbol": old.get("symbol") or broker_symbol,
+                "side": old.get("side"),
+                "volume": old.get("volume"),
+                "openPrice": deal.get("openPrice") or old.get("openPrice"),
+                "closePrice": deal.get("closePrice"),
+                "pnl": round(float(pnl or 0), 2),
+                "closedAt": deal.get("closedAt") or _iso(),
+                "magic": magic,
+                "modelName": state.get("modelName") or MQL5_105_SPEC["name"],
+                "source": "mt5",
+            })
+            rows = [c for c in (state.get("closed") or []) if str(c.get("ticket")) != str(ticket)]
+            rows.append(record)
+            state["closed"] = rows[-200:]
+            self._arena_notify(account_id, "trade", (
+                "🔴 105 CLOSE\n"
+                "🧠 %s\n"
+                "📉 %s %s %.2f\n"
+                "💰 P/L %+.2f\n"
+                "🏷 magic %s · #%s"
+            ) % (
+                state.get("modelName") or MQL5_105_SPEC["name"],
+                record.get("symbol"),
+                str(record.get("side") or "").upper(),
+                float(record.get("volume") or 0),
+                float(record.get("pnl") or 0),
+                magic,
+                ticket,
+            ))
+
+        if not own and bid > 0 and ask > 0:
+            buy_lot = calc_lot(loss["buy"])
+            sell_lot = calc_lot(loss["sell"])
+            for side, lot, price, stop in (
+                ("buy", buy_lot, ask, ask - sl_dist),
+                ("sell", sell_lot, bid, bid + sl_dist),
+            ):
+                if dry:
+                    state["decisions"].append({
+                        "id": "105d%d" % int(time.time() * 1000),
+                        "at": _iso(),
+                        "action": "hold",
+                        "symbol": symbol,
+                        "side": side,
+                        "price": round(price, digits),
+                        "volume": lot,
+                        "reason": "105 dry-run: would open %s %.2f lots, SL %.5f." % (side.upper(), lot, stop),
+                    })
+                    continue
+                try:
+                    with self._locked():
+                        res = self.pool.open_position(creds, {
+                            "symbol": symbol,
+                            "side": side,
+                            "volume": lot,
+                            "stopLoss": round(stop, digits),
+                            "takeProfit": 0,
+                            "magic": magic,
+                            "comment": "105 arena",
+                        })
+                    order = res.get("order") or {}
+                    ticket = order.get("ticket") or order.get("deal")
+                    self._arena_notify(account_id, "trade", (
+                        "🟢 105 OPEN\n"
+                        "🧠 %s\n"
+                        "📈 %s %s %.2f @ %s\n"
+                        "🛑 SL %s · 🎯 TP —\n"
+                        "🏷 magic %s · #%s"
+                    ) % (
+                        state.get("modelName") or MQL5_105_SPEC["name"],
+                        symbol,
+                        side.upper(),
+                        lot,
+                        round(price, digits),
+                        round(stop, digits),
+                        magic,
+                        ticket,
+                    ))
+                except Exception as e:
+                    state["error"] = "105 open failed: %s" % e
+                    self._arena_notify(account_id, "error", "⚠️ 105 open %s failed: %s" % (side.upper(), str(e)[:200]))
+            try:
+                with self._locked():
+                    all_positions = self.pool.positions(creds) or []
+            except Exception:
+                all_positions = []
+            own = [
+                p for p in all_positions
+                if int(p.get("magic") or 0) == magic
+                and str(p.get("symbol") or "").upper() == broker_symbol.upper()
+            ]
+
+        elif len(own) == 1 and bid > 0 and ask > 0:
+            p = own[0]
+            side = str(p.get("side") or "").lower()
+            open_price = float(p.get("openPrice") or 0)
+            current_sl = float(p.get("stopLoss") or 0)
+            current_price = bid if side == "buy" else ask
+            ticket = p.get("ticket")
+            if side == "buy":
+                new_sl = round(current_price - trail_dist, digits)
+                if new_sl > current_sl or current_sl < open_price:
+                    target = round(max(new_sl, open_price + secure_dist), digits)
+                    ok = False
+                    err = None
+                    if not dry:
+                        try:
+                            with self._locked():
+                                res = self.pool.modify_position(creds, {
+                                    "ticket": ticket,
+                                    "stopLoss": target,
+                                    "takeProfit": 0,
+                                })
+                            ok = int((res.get("position") or {}).get("retcode") or 0) == 10009
+                            if ok:
+                                p["stopLoss"] = target
+                        except Exception as e:
+                            err = str(e)
+                    loss["sell"] += 1
+                    loss["buy"] = 0
+                    state["decisions"].append({
+                        "id": "105t%d" % int(time.time() * 1000),
+                        "at": _iso(),
+                        "action": "trail" if ok else "hold",
+                        "symbol": symbol,
+                        "side": side,
+                        "price": round(current_price, digits),
+                        "volume": p.get("volume"),
+                        "reason": "105 %s SL -> %.5f (%s); sellLoss=%d buyLoss=%d." % (
+                            "buy" if ok else "buy-modify-skipped",
+                            target,
+                            "ok" if ok else (err or "invalid or dry"),
+                            loss["sell"],
+                            loss["buy"],
+                        ),
+                    })
+            elif side == "sell":
+                new_sl = round(current_price + trail_dist, digits)
+                if new_sl < current_sl or current_sl > open_price:
+                    target = round(min(new_sl, open_price - secure_dist), digits)
+                    ok = False
+                    err = None
+                    if not dry:
+                        try:
+                            with self._locked():
+                                res = self.pool.modify_position(creds, {
+                                    "ticket": ticket,
+                                    "stopLoss": target,
+                                    "takeProfit": 0,
+                                })
+                            ok = int((res.get("position") or {}).get("retcode") or 0) == 10009
+                            if ok:
+                                p["stopLoss"] = target
+                        except Exception as e:
+                            err = str(e)
+                    loss["buy"] += 1
+                    loss["sell"] = 0
+                    state["decisions"].append({
+                        "id": "105t%d" % int(time.time() * 1000),
+                        "at": _iso(),
+                        "action": "trail" if ok else "hold",
+                        "symbol": symbol,
+                        "side": side,
+                        "price": round(current_price, digits),
+                        "volume": p.get("volume"),
+                        "reason": "105 %s SL -> %.5f (%s); buyLoss=%d sellLoss=%d." % (
+                            "sell" if ok else "sell-modify-skipped",
+                            target,
+                            "ok" if ok else (err or "invalid or dry"),
+                            loss["buy"],
+                            loss["sell"],
+                        ),
+                    })
+
+        if len(state["decisions"]) > 300:
+            state["decisions"] = state["decisions"][-300:]
+        state["lossCounts"] = {"buy": int(loss["buy"]), "sell": int(loss["sell"])}
+        state["positions"] = [
+            dict(p, modelName=state.get("modelName") or MQL5_105_SPEC["name"], magic=magic)
+            for p in own
+        ]
+        state["floating"] = round(sum(float(p.get("profit") or 0) for p in own), 2)
+        state["aiPnl"] = round(
+            sum(float(c.get("pnl") or 0) for c in (state.get("closed") or [])) + float(state["floating"]),
+            2,
+        )
+        state["updatedAt"] = _iso()
+        if post:
+            post(state)
+        else:
+            self._post(account_id, state)
 
     def run_account(self, row: Dict[str, Any], model: Optional[Dict[str, Any]] = None, post=None) -> None:
         cfg = (model or {}).get("config") or row.get("config") or {}
