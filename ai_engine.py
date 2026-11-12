@@ -7,6 +7,7 @@ a human-readable reason that the terminal streams live.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -1592,14 +1593,32 @@ class AIAgent:
         return []
 
     def _upload_setup_image(self, account_id: str, record: Dict[str, Any], phase: str, png: bytes) -> Optional[str]:
-        base = str(os.environ.get("MT5_SUPABASE_URL") or "").rstrip("/")
-        key = str(os.environ.get("MT5_SUPABASE_KEY") or "")
-        if not base or not key or not png:
+        if not png:
             return None
-        bucket = str(os.environ.get("MT5_STORE_BUCKET") or os.environ.get("MT5_SUPABASE_BUCKET") or "mt5-bridge")
         account = re.sub(r"[^A-Za-z0-9_.-]", "_", str(account_id or "account"))[:64]
         ticket = re.sub(r"[^A-Za-z0-9_.-]", "_", str(record.get("ticket") or "trade"))[:40]
         path = "setups/%s/%s-%s.png" % (account, ticket, phase)
+        api_url = str(os.environ.get("MT5_API_URL") or "").rstrip("/")
+        worker_secret = str(os.environ.get("MT5_WORKER_SECRET") or "")
+        if api_url and worker_secret:
+            try:
+                res = requests.post(
+                    api_url + "/v1/worker/setup-image",
+                    headers={"x-worker-secret": worker_secret},
+                    json={"accountId": account_id, "ticket": ticket, "phase": phase, "image": base64.b64encode(png).decode("ascii")},
+                    timeout=20,
+                )
+                if 200 <= res.status_code < 300:
+                    saved = res.json() if res.content else {}
+                    return str(saved.get("path") or path)
+                self.log("setup upload %s failed: HTTP %s %s" % (path, res.status_code, res.text[:160]))
+            except Exception as e:
+                self.log("setup upload %s failed: %s" % (path, e))
+        base = str(os.environ.get("MT5_SUPABASE_URL") or "").rstrip("/")
+        key = str(os.environ.get("MT5_SUPABASE_KEY") or "")
+        if not base or not key:
+            return None
+        bucket = str(os.environ.get("MT5_STORE_BUCKET") or os.environ.get("MT5_SUPABASE_BUCKET") or "mt5-bridge")
         try:
             res = requests.post(
                 "%s/storage/v1/object/%s/%s" % (base, bucket, path),
@@ -1626,22 +1645,31 @@ class AIAgent:
         if not record.get("stopLoss") or not record.get("takeProfit") or not record.get("openedAt"):
             return
         images: Dict[str, str] = {}
+        last_error = ""
         for phase in ("before", "after"):
             try:
                 bars = self._setup_bars(creds, record, phase)
                 if not bars:
+                    last_error = "no %s bars" % phase
                     continue
                 png = render_setup_png(bars, record, phase)
                 if not png:
+                    last_error = "render %s failed" % phase
                     continue
                 path = self._upload_setup_image(account_id, record, phase, png)
                 if path:
                     images[phase] = path
+                else:
+                    last_error = "upload %s failed" % phase
             except Exception as e:
+                last_error = "%s: %s" % (phase, e)
                 self.log("setup image %s %s failed: %s" % (record.get("ticket"), phase, e))
         if images:
             record["setupImages"] = images
             record["setupAt"] = _iso()
+            record.pop("setupError", None)
+        elif last_error:
+            record["setupError"] = last_error
 
     def _arena_reconcile_history(self, creds: Dict[str, Any], arena: Dict[str, Any], specs: List[Dict[str, Any]], account_id: Optional[str] = None) -> int:
         magics = []
@@ -1663,6 +1691,7 @@ class AIAgent:
             except Exception as e:
                 self.log("arena order backfill failed: %s" % e)
         generated = 0
+        attempted = 0
         for spec in specs:
             model = (arena.get("models") or {}).get(spec["id"]) or {}
             mstate = model.get("state") or {}
@@ -1706,13 +1735,15 @@ class AIAgent:
                 "analytics": analytics,
             }
             for item in merged:
-                if generated >= 4:
+                if attempted >= 4:
                     break
                 if item.get("setupImages") or not item.get("stopLoss") or not item.get("takeProfit") or not item.get("openedAt"):
                     continue
                 if account_id:
+                    attempted += 1
                     self._attach_setup(creds, account_id, item)
-                    generated += 1
+                    if item.get("setupImages"):
+                        generated += 1
             model["state"] = mstate
             arena["models"][spec["id"]] = model
         return len(positions)
