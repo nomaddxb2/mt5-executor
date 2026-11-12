@@ -150,6 +150,7 @@ jobs:
           MT5_SUPABASE_URL: ${{ secrets.MT5_SUPABASE_URL }}
           MT5_SUPABASE_KEY: ${{ secrets.MT5_SUPABASE_KEY }}
           MT5_DRY_RUN: ${{ vars.MT5_DRY_RUN || '0' }}
+          MT5_WATCHLIST: 'GOLD_mini,XAUUSD,BTCUSD,GBPUSD,USDJPY,US30,NAS100'
           MT5_POLL_SECONDS: '1'
           MT5_SNAPSHOT_SECONDS: '1'
           MT5_AI_ENABLED: '1'
