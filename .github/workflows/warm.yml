@@ -59,19 +59,45 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      - name: Resolve terminal broker
+        id: terminal
+        shell: pwsh
+        env:
+          MT5_API_URL: ${{ secrets.MT5_API_URL }}
+          MT5_WORKER_SECRET: ${{ secrets.MT5_WORKER_SECRET }}
+        run: |
+          $headers = @{ 'X-Worker-Secret' = $env:MT5_WORKER_SECRET; 'Content-Type' = 'application/json' }
+          $payload = @{ shard = [int]'${{ matrix.shard }}'; shards = [int]'${{ needs.plan.outputs.count }}' } | ConvertTo-Json
+          $resp = Invoke-RestMethod -Uri "$($env:MT5_API_URL.TrimEnd('/'))/v1/worker/ai/accounts" -Method Post -Headers $headers -Body $payload
+          $server = ''
+          if ($resp.accounts -and @($resp.accounts).Count -gt 0) { $server = [string]@($resp.accounts)[0].credentials.server }
+          if ($server -match 'fxpro') {
+            $key = 'mt5-fxpro-metaquotes-20261112'
+            $url = 'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe'
+            $broker = 'fxpro'
+          } else {
+            $key = 'mt5-exness-6314'
+            $url = 'https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe'
+            $broker = 'exness'
+          }
+          "cache_key=$key" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "setup_url=$url" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "broker=$broker" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "terminal broker=$broker server=$server"
+
       - name: Cache MetaTrader 5 terminal
         id: mt5-cache
         uses: actions/cache@v4
         with:
           path: C:\mt5
-          key: mt5-exness-6314
+          key: ${{ steps.terminal.outputs.cache_key }}
 
       - name: Install MetaTrader 5
         if: steps.mt5-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $setup = Join-Path $env:RUNNER_TEMP 'exness5setup.exe'
-          Invoke-WebRequest -Uri 'https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe' -OutFile $setup
+          $setup = Join-Path $env:RUNNER_TEMP ([IO.Path]::GetFileName('${{ steps.terminal.outputs.setup_url }}'))
+          Invoke-WebRequest -Uri '${{ steps.terminal.outputs.setup_url }}' -OutFile $setup
           Start-Process -FilePath $setup -ArgumentList '/auto' -Wait
           $roots = @('C:\Program Files', 'C:\Program Files (x86)', (Join-Path $env:LOCALAPPDATA 'Programs'))
           $src = $null
@@ -81,7 +107,7 @@ jobs:
           }
           if (-not $src) {
             Get-ChildItem 'C:\Program Files' -Directory | Select-Object -ExpandProperty FullName
-            throw 'Exness MetaTrader 5 installation did not produce terminal64.exe'
+            throw 'MetaTrader 5 installation did not produce terminal64.exe'
           }
           $dir = $src.Directory.FullName
           Write-Host "found terminal at $dir"
