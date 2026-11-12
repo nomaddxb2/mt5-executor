@@ -850,6 +850,84 @@ class TerminalPool:
             })
         return out
 
+    def rates_range(self, credentials: Dict[str, Any], symbol: str, timeframe: str = "M15", start: Any = None, end: Any = None) -> List[Dict[str, Any]]:
+        self._ensure(credentials)
+        if self.dry_run or mt5 is None:
+            return []
+        broker = self._resolve(symbol)
+        tf = _timeframe(timeframe)
+        if tf is None:
+            raise Mt5Error("Unsupported timeframe: %s" % timeframe, "invalid_timeframe")
+        start_dt = _parse_time(start)
+        end_dt = _parse_time(end) or datetime.now(timezone.utc)
+        if start_dt is None:
+            raise Mt5Error("Invalid range start", "invalid_range")
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=timezone.utc)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        if end_dt <= start_dt:
+            end_dt = start_dt + timedelta(minutes=5)
+        mt5.symbol_select(broker, True)
+        rows = mt5.copy_rates_range(broker, tf, start_dt, end_dt)
+        if rows is None:
+            code, message = mt5.last_error()
+            raise Mt5Error("copy_rates_range failed for %s: %s" % (broker, message), "rates_failed", {"code": code})
+        out = []
+        for row in rows:
+            out.append({
+                "time": _iso(int(row["time"])),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "tickVolume": float(row["tick_volume"]),
+                "spread": float(row["spread"]),
+            })
+        return out
+
+    def history_order_details(self, credentials: Dict[str, Any], tickets: Any = None, since: Any = None) -> Dict[int, Dict[str, Any]]:
+        self._ensure(credentials)
+        if self.dry_run or mt5 is None:
+            return {}
+        wanted = set()
+        for value in tickets or []:
+            try:
+                wanted.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        since_dt = _parse_time(since)
+        if since_dt is not None and since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        frm = (since_dt - timedelta(days=3)) if since_dt else (now - timedelta(days=30))
+        rows = mt5.history_orders_get(frm, now)
+        if rows is None:
+            code, message = mt5.last_error()
+            raise Mt5Error("history_orders_get failed: %s" % message, "mt5_history_failed", {"code": code})
+        out: Dict[int, Dict[str, Any]] = {}
+        for order in rows:
+            d = order._asdict()
+            position_id = int(d.get("position_id") or 0)
+            if not position_id or (wanted and position_id not in wanted):
+                continue
+            sl = float(d.get("sl") or 0)
+            tp = float(d.get("tp") or 0)
+            if not sl and not tp:
+                continue
+            stamp = int(d.get("time_done") or d.get("time_setup") or 0)
+            current = out.get(position_id)
+            if current and int(current.get("stamp") or 0) > stamp:
+                continue
+            opened = int(d.get("time_setup") or 0)
+            out[position_id] = {
+                "stopLoss": _num(sl, 5) if sl else None,
+                "takeProfit": _num(tp, 5) if tp else None,
+                "openedAt": _iso(opened) if opened else None,
+                "stamp": stamp,
+            }
+        return out
+
     def spec(self, credentials: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         self._ensure(credentials)
         if self.dry_run or mt5 is None:
@@ -895,7 +973,19 @@ class TerminalPool:
                 profit += float(d.profit) + float(d.commission) + float(d.swap)
             except Exception:
                 continue
-        return {"ticket": ticket, "profit": round(profit, 2), "deals": len(rows)}
+        entries = [d for d in rows if int(getattr(d, "entry", -1) if getattr(d, "entry", None) is not None else -1) == 0]
+        exits = [d for d in rows if int(getattr(d, "entry", -1) if getattr(d, "entry", None) is not None else -1) in (1, 3)]
+        entry = min(entries, key=lambda d: int(getattr(d, "time", 0) or 0)) if entries else None
+        exit_deal = max(exits, key=lambda d: int(getattr(d, "time", 0) or 0)) if exits else None
+        return {
+            "ticket": ticket,
+            "profit": round(profit, 2),
+            "deals": len(rows),
+            "openPrice": _num(getattr(entry, "price", None), 5) if entry is not None else None,
+            "closePrice": _num(getattr(exit_deal, "price", None), 5) if exit_deal is not None else None,
+            "openedAt": _iso(int(getattr(entry, "time", 0) or 0)) if entry is not None and int(getattr(entry, "time", 0) or 0) else None,
+            "closedAt": _iso(int(getattr(exit_deal, "time", 0) or 0)) if exit_deal is not None and int(getattr(exit_deal, "time", 0) or 0) else None,
+        }
 
     # ---------------------------------------------------------------- writes
     def open_position(self, credentials: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1275,10 +1365,15 @@ class TerminalPool:
 
 
 def _parse_time(value: Any) -> Optional[datetime]:
-    if not value:
+    if value is None or value == "":
         return None
     if isinstance(value, datetime):
         return value
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
     try:
         text = str(value).replace("Z", "+00:00")
         return datetime.fromisoformat(text)

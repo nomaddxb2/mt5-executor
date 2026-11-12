@@ -11,9 +11,14 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
+import requests
+
+from setup_chart import render_setup_png
 
 MAGIC = int(os.environ.get("MT5_AI_MAGIC", "20261109"))
 
@@ -48,6 +53,7 @@ ZERO_STATS = {
 ARENA_VERSION = 3
 ARENA_START_MAGIC = 20261110
 ARENA_BEST_MAGIC = 20261120
+TF_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400}
 
 AI_LENSES = {
     "Momentum": {
@@ -116,6 +122,17 @@ def _trade_comment(text: Any, fallback: str = "AI") -> str:
 
 def _iso(ts: Optional[float] = None) -> str:
     return datetime.fromtimestamp(ts if ts is not None else time.time(), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_ts(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
 
 
 def _num(value: Any, digits: int = 5) -> Any:
@@ -951,6 +968,100 @@ def compute_stats(closed: List[Dict[str, Any]], starting_equity: float) -> Dict[
     }
 
 
+def build_trade_analytics(closed: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not closed:
+        return {
+            "symbols": [], "symbolStats": [], "topPairs": [], "bottomPairs": [], "bestPair": None, "worstPair": None,
+            "sideStats": {}, "avgWin": 0, "avgLoss": 0, "payoff": 0,
+            "largestWin": 0, "largestLoss": 0, "currentStreak": 0, "bestWinStreak": 0, "worstLossStreak": 0,
+        }
+    rows = sorted(closed, key=lambda r: str(r.get("closedAt") or ""))
+    symbols: Dict[str, Dict[str, Any]] = {}
+    sides: Dict[str, Dict[str, Any]] = {}
+    wins: List[float] = []
+    losses: List[float] = []
+    for row in rows:
+        try:
+            pnl = float(row.get("pnl") or 0)
+        except (TypeError, ValueError):
+            pnl = 0.0
+        symbol = _base(row.get("symbol") or "?") or "?"
+        side = "short" if str(row.get("side") or "").lower() == "sell" else "long"
+        try:
+            r_value = float(row.get("r") or 0)
+        except (TypeError, ValueError):
+            r_value = 0.0
+        bucket = symbols.setdefault(symbol, {
+            "symbol": symbol, "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "r": 0.0,
+            "long": 0, "short": 0, "grossWin": 0.0, "grossLoss": 0.0,
+        })
+        bucket["trades"] += 1
+        bucket["pnl"] = round(float(bucket["pnl"]) + pnl, 2)
+        bucket["r"] = round(float(bucket["r"]) + r_value, 3)
+        bucket[side] += 1
+        if pnl > 0:
+            bucket["wins"] += 1
+            bucket["grossWin"] = round(float(bucket["grossWin"]) + pnl, 2)
+            wins.append(pnl)
+        elif pnl < 0:
+            bucket["losses"] += 1
+            bucket["grossLoss"] = round(float(bucket["grossLoss"]) + abs(pnl), 2)
+            losses.append(abs(pnl))
+        side_bucket = sides.setdefault(side, {"side": side, "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0})
+        side_bucket["trades"] += 1
+        side_bucket["pnl"] = round(float(side_bucket["pnl"]) + pnl, 2)
+        if pnl > 0:
+            side_bucket["wins"] += 1
+        elif pnl < 0:
+            side_bucket["losses"] += 1
+
+    pair_rows = []
+    for bucket in symbols.values():
+        trades = int(bucket["trades"])
+        bucket["winRate"] = round(bucket["wins"] / trades, 4) if trades else 0
+        bucket["avgR"] = round(float(bucket["r"]) / trades, 3) if trades else 0
+        bucket["profitFactor"] = round(float(bucket["grossWin"]) / float(bucket["grossLoss"]), 3) if bucket["grossLoss"] else (round(float(bucket["grossWin"]), 3) if bucket["grossWin"] else 0)
+        pair_rows.append(bucket)
+    pair_rows.sort(key=lambda r: (float(r.get("pnl") or 0), int(r.get("wins") or 0)), reverse=True)
+    for bucket in sides.values():
+        trades = int(bucket["trades"])
+        bucket["winRate"] = round(bucket["wins"] / trades, 4) if trades else 0
+    current = best_win = worst_loss = 0
+    for row in rows:
+        try:
+            pnl = float(row.get("pnl") or 0)
+        except (TypeError, ValueError):
+            pnl = 0.0
+        if pnl > 0:
+            current = current + 1 if current > 0 else 1
+            best_win = max(best_win, current)
+        elif pnl < 0:
+            current = current - 1 if current < 0 else -1
+            worst_loss = min(worst_loss, current)
+        else:
+            current = 0
+    avg_win = round(sum(wins) / len(wins), 2) if wins else 0
+    avg_loss = round(sum(losses) / len(losses), 2) if losses else 0
+    payoff = round(avg_win / avg_loss, 3) if avg_loss else (round(avg_win, 3) if avg_win else 0)
+    return {
+        "symbols": pair_rows,
+        "symbolStats": pair_rows,
+        "topPairs": pair_rows[:3],
+        "bottomPairs": list(reversed(pair_rows[-2:])) if len(pair_rows) > 1 else [],
+        "bestPair": pair_rows[0] if pair_rows else None,
+        "worstPair": pair_rows[-1] if pair_rows else None,
+        "sideStats": sides,
+        "avgWin": avg_win,
+        "avgLoss": avg_loss,
+        "payoff": payoff,
+        "largestWin": round(max(wins), 2) if wins else 0,
+        "largestLoss": round(max(losses), 2) if losses else 0,
+        "currentStreak": current,
+        "bestWinStreak": best_win,
+        "worstLossStreak": abs(worst_loss),
+    }
+
+
 def initial_state() -> Dict[str, Any]:
     return {
         "running": False,
@@ -1326,7 +1437,7 @@ class AIAgent:
                     spec.get("name") or spec["id"], str(e)[:240]))
 
         try:
-            reconciled = self._arena_reconcile_history(creds, arena, specs)
+            reconciled = self._arena_reconcile_history(creds, arena, specs, account_id)
             if reconciled:
                 self.log("arena history reconciled %d closed positions" % reconciled)
         except Exception as e:
@@ -1348,25 +1459,89 @@ class AIAgent:
             state["floating"] = round(sum(float(((arena["models"].get(row.get("id")) or {}).get("state") or {}).get("floating") or 0) for row in arena["leaderboard"]), 2)
         arena["cycle"] = int(arena.get("cycle") or 0) + 1
         board_at = float(arena.get("telegramBoardAt") or 0)
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
         if arena["leaderboard"] and time.time() - board_at >= 300:
-            medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-            lines = ["🏆 ARENA LEADERBOARD · cycle %d" % arena["cycle"]]
+            lines = [
+                "🏆 ARENA LEADERBOARD",
+                "Cycle %d · %d books · same account" % (arena["cycle"], len(arena["leaderboard"])),
+                "",
+            ]
             for row in arena["leaderboard"]:
-                lines.append("%s #%d %s · %s · P/L %+.2f · %d trades (%dW/%dL) · %.1f%% win · PF %.2f · %d open" % (
+                best = row.get("bestPair") or {}
+                lines.append("%s #%d %s" % (
                     medals.get(int(row.get("rank") or 0), "•"),
                     int(row.get("rank") or 0),
                     row.get("name") or "model",
-                    row.get("role") or "AI",
+                ))
+                lines.append("   💰 P/L %+.2f · 🎯 %.1f%% win · ⚖️ PF %.2f" % (
                     float(row.get("pnl") or 0),
-                    int(row.get("trades") or 0),
+                    float(row.get("winRate") or 0) * 100.0,
+                    float(row.get("profitFactor") or 0),
+                ))
+                lines.append("   ✅ %dW · ❌ %dL · 📊 %d trades · 📌 %d open" % (
                     int(row.get("wins") or 0),
                     int(row.get("losses") or 0),
-                    float(row.get("winRate") or 0),
-                    float(row.get("profitFactor") or 0),
+                    int(row.get("trades") or 0),
                     int(row.get("positions") or 0),
                 ))
+                if best.get("symbol"):
+                    lines.append("   🏆 Best pair: %s %+.2f · %dW/%dL" % (
+                        best.get("symbol"),
+                        float(best.get("pnl") or 0),
+                        int(best.get("wins") or 0),
+                        int(best.get("losses") or 0),
+                    ))
+                lines.append("")
             self._arena_notify(account_id, "leaderboard", "\n".join(lines))
             arena["telegramBoardAt"] = time.time()
+
+        analytics_at = float(arena.get("telegramAnalyticsAt") or 0)
+        if arena["leaderboard"] and time.time() - analytics_at >= 1800:
+            lines = [
+                "📊 ARENA DEEP DIVE",
+                "Cycle %d · pair edge, side bias, streaks" % arena["cycle"],
+                "",
+            ]
+            for row in arena["leaderboard"]:
+                analytics = row.get("analytics") or {}
+                best = analytics.get("bestPair") or row.get("bestPair") or {}
+                worst = analytics.get("worstPair") or row.get("worstPair") or {}
+                sides = analytics.get("sideStats") or {}
+                long = sides.get("long") or {}
+                short = sides.get("short") or {}
+                streak = row.get("streak") or {}
+                current = int(streak.get("current") or 0)
+                streak_text = ("🔥 %dW" % current) if current > 0 else (("🧊 %dL" % abs(current)) if current < 0 else "➖ flat")
+                lines.append("%s %s" % (medals.get(int(row.get("rank") or 0), "•"), row.get("name") or "model"))
+                if best.get("symbol"):
+                    lines.append("   🏆 Best pair: %s %+.2f · %dW/%dL · %.0f%% win" % (
+                        best.get("symbol"), float(best.get("pnl") or 0),
+                        int(best.get("wins") or 0), int(best.get("losses") or 0),
+                        float(best.get("winRate") or 0) * 100.0,
+                    ))
+                if worst.get("symbol"):
+                    lines.append("   ⚠️ Weakest: %s %+.2f · %dW/%dL" % (
+                        worst.get("symbol"), float(worst.get("pnl") or 0),
+                        int(worst.get("wins") or 0), int(worst.get("losses") or 0),
+                    ))
+                lines.append("   🟢 Long %d · %dW/%dL · %+.2f" % (
+                    int(long.get("trades") or 0), int(long.get("wins") or 0),
+                    int(long.get("losses") or 0), float(long.get("pnl") or 0),
+                ))
+                lines.append("   🔴 Short %d · %dW/%dL · %+.2f" % (
+                    int(short.get("trades") or 0), int(short.get("wins") or 0),
+                    int(short.get("losses") or 0), float(short.get("pnl") or 0),
+                ))
+                lines.append("   📊 Avg win %+.2f · avg loss %+.2f · 💪 payoff %.2fx" % (
+                    float(row.get("avgWin") or 0), -abs(float(row.get("avgLoss") or 0)),
+                    float(row.get("payoff") or 0),
+                ))
+                lines.append("   🔥 Streak %s · 🏅 best %dW · 🛡 worst %dL" % (
+                    streak_text, int(streak.get("bestWin") or 0), int(streak.get("worstLoss") or 0),
+                ))
+                lines.append("")
+            self._arena_notify(account_id, "analytics", "\n".join(lines))
+            arena["telegramAnalyticsAt"] = time.time()
         arena["updatedAt"] = _iso()
         arena["running"] = True
         arena["modelCount"] = len(arena["models"])
@@ -1382,7 +1557,93 @@ class AIAgent:
             except Exception as e:
                 self.log("ai account callback failed: %s" % e)
 
-    def _arena_reconcile_history(self, creds: Dict[str, Any], arena: Dict[str, Any], specs: List[Dict[str, Any]]) -> int:
+    def _setup_bars(self, creds: Dict[str, Any], record: Dict[str, Any], phase: str) -> List[Dict[str, Any]]:
+        symbol = record.get("symbol")
+        if not symbol:
+            return []
+        requested = str(record.get("timeframe") or "M15").upper()
+        opened = _parse_ts(record.get("openedAt"))
+        closed = _parse_ts(record.get("closedAt")) or time.time()
+        if opened is None:
+            opened = closed - 30 * TF_SECONDS.get(requested, 900)
+        frames = [requested]
+        for fallback in ("M15", "M5", "H1"):
+            if fallback not in frames:
+                frames.append(fallback)
+        for timeframe in frames:
+            step = TF_SECONDS.get(timeframe, 900)
+            if phase == "before":
+                start = opened - step * 42
+                end = opened + step * 0.5
+            else:
+                start = opened - step * 8
+                end = max(closed, opened + step * 4) + step * 6
+            end = min(end, time.time() + step * 0.5)
+            if end <= start:
+                continue
+            try:
+                with self._locked():
+                    bars = self.pool.rates_range(creds, symbol, timeframe, start, end)
+            except Exception as e:
+                self.log("setup rates %s %s failed: %s" % (symbol, timeframe, e))
+                continue
+            if len(bars) >= 8:
+                return bars
+        return []
+
+    def _upload_setup_image(self, account_id: str, record: Dict[str, Any], phase: str, png: bytes) -> Optional[str]:
+        base = str(os.environ.get("MT5_SUPABASE_URL") or "").rstrip("/")
+        key = str(os.environ.get("MT5_SUPABASE_KEY") or "")
+        if not base or not key or not png:
+            return None
+        bucket = str(os.environ.get("MT5_STORE_BUCKET") or os.environ.get("MT5_SUPABASE_BUCKET") or "mt5-bridge")
+        account = re.sub(r"[^A-Za-z0-9_.-]", "_", str(account_id or "account"))[:64]
+        ticket = re.sub(r"[^A-Za-z0-9_.-]", "_", str(record.get("ticket") or "trade"))[:40]
+        path = "setups/%s/%s-%s.png" % (account, ticket, phase)
+        try:
+            res = requests.post(
+                "%s/storage/v1/object/%s/%s" % (base, bucket, path),
+                headers={
+                    "apikey": key,
+                    "Authorization": "Bearer " + key,
+                    "Content-Type": "image/png",
+                    "x-upsert": "true",
+                    "Cache-Control": "max-age=600",
+                },
+                data=png,
+                timeout=10,
+            )
+            if 200 <= res.status_code < 300:
+                return path
+            self.log("setup upload %s failed: HTTP %s" % (path, res.status_code))
+        except Exception as e:
+            self.log("setup upload %s failed: %s" % (path, e))
+        return None
+
+    def _attach_setup(self, creds: Dict[str, Any], account_id: str, record: Dict[str, Any]) -> None:
+        if record.get("setupImages"):
+            return
+        if not record.get("stopLoss") or not record.get("takeProfit") or not record.get("openedAt"):
+            return
+        images: Dict[str, str] = {}
+        for phase in ("before", "after"):
+            try:
+                bars = self._setup_bars(creds, record, phase)
+                if not bars:
+                    continue
+                png = render_setup_png(bars, record, phase)
+                if not png:
+                    continue
+                path = self._upload_setup_image(account_id, record, phase, png)
+                if path:
+                    images[phase] = path
+            except Exception as e:
+                self.log("setup image %s %s failed: %s" % (record.get("ticket"), phase, e))
+        if images:
+            record["setupImages"] = images
+            record["setupAt"] = _iso()
+
+    def _arena_reconcile_history(self, creds: Dict[str, Any], arena: Dict[str, Any], specs: List[Dict[str, Any]], account_id: Optional[str] = None) -> int:
         magics = []
         for spec in specs:
             model = (arena.get("models") or {}).get(spec["id"]) or {}
@@ -1393,6 +1654,15 @@ class AIAgent:
         by_magic: Dict[int, List[Dict[str, Any]]] = {}
         for record in positions:
             by_magic.setdefault(int(record.get("magic") or 0), []).append(record)
+        order_details: Dict[int, Dict[str, Any]] = {}
+        missing_orders = [record.get("ticket") for record in positions if not record.get("stopLoss") or not record.get("takeProfit")]
+        if missing_orders:
+            try:
+                with self._locked():
+                    order_details = self.pool.history_order_details(creds, missing_orders, arena.get("startedAt"))
+            except Exception as e:
+                self.log("arena order backfill failed: %s" % e)
+        generated = 0
         for spec in specs:
             model = (arena.get("models") or {}).get(spec["id"]) or {}
             mstate = model.get("state") or {}
@@ -1406,11 +1676,22 @@ class AIAgent:
                 item.update(record)
                 if old.get("reason"):
                     item["reason"] = old["reason"]
+                item.setdefault("timeframe", old.get("timeframe") or "M15")
+                item.setdefault("modelName", old.get("modelName") or model.get("name") or spec.get("name"))
+                detail = order_details.get(int(record.get("ticket") or 0)) or {}
+                if detail.get("stopLoss") and not item.get("stopLoss"):
+                    item["stopLoss"] = detail["stopLoss"]
+                if detail.get("takeProfit") and not item.get("takeProfit"):
+                    item["takeProfit"] = detail["takeProfit"]
+                if detail.get("openedAt") and not item.get("openedAt"):
+                    item["openedAt"] = detail["openedAt"]
                 item["source"] = "mt5"
                 merged.append(item)
             mstate["closed"] = merged[-100:]
             stats = compute_stats(merged, float(mstate.get("startingEquity") or arena.get("startingEquity") or 0))
+            analytics = build_trade_analytics(merged)
             mstate["stats"] = stats
+            mstate["analytics"] = analytics
             realized = round(sum(float(r.get("pnl") or 0) for r in merged), 2)
             floating = round(sum(float(p.get("profit") or 0) for p in (mstate.get("positions") or [])), 2)
             mstate["floating"] = floating
@@ -1422,7 +1703,16 @@ class AIAgent:
                 "pnl": realized,
                 "source": "mt5",
                 "asOf": _iso(),
+                "analytics": analytics,
             }
+            for item in merged:
+                if generated >= 4:
+                    break
+                if item.get("setupImages") or not item.get("stopLoss") or not item.get("takeProfit") or not item.get("openedAt"):
+                    continue
+                if account_id:
+                    self._attach_setup(creds, account_id, item)
+                    generated += 1
             model["state"] = mstate
             arena["models"][spec["id"]] = model
         return len(positions)
@@ -1434,6 +1724,7 @@ class AIAgent:
             s = model.get("state") or {}
             stats = s.get("stats") or {}
             history_stats = s.get("historyStats") or {}
+            analytics = s.get("analytics") or history_stats.get("analytics") or {}
             pnl = float(s.get("aiPnl") or 0)
             realized = history_stats.get("pnl")
             if realized is None:
@@ -1459,6 +1750,17 @@ class AIAgent:
                 "profitFactor": float(stats.get("profitFactor") or 0),
                 "expectancy": float(stats.get("expectancy") or 0),
                 "maxDrawdownPct": float(stats.get("maxDrawdownPct") or 0),
+                "analytics": analytics,
+                "bestPair": analytics.get("bestPair"),
+                "worstPair": analytics.get("worstPair"),
+                "avgWin": float(analytics.get("avgWin") or 0),
+                "avgLoss": float(analytics.get("avgLoss") or 0),
+                "payoff": float(analytics.get("payoff") or 0),
+                "streak": {
+                    "current": int(analytics.get("currentStreak") or 0),
+                    "bestWin": int(analytics.get("bestWinStreak") or 0),
+                    "worstLoss": int(analytics.get("worstLossStreak") or 0),
+                },
                 "positions": len(s.get("positions") or []),
                 "cycle": int(s.get("cycle") or 0),
                 "running": bool(s.get("running")),
@@ -1732,6 +2034,7 @@ class AIAgent:
             if str(old.get("ticket")) in current_tickets:
                 continue
             pnl = 0.0
+            res: Dict[str, Any] = {}
             with self._locked():
                 try:
                     res = self.pool.deal_result(creds, old.get("ticket"))
@@ -1741,21 +2044,33 @@ class AIAgent:
             risk_amount = float(old.get("riskAmount") or 1.0)
             reward = pnl / risk_amount if risk_amount > 0 else 0.0
             weights = learn(weights, old.get("contributions") or {}, reward, float(state.get("learning", {}).get("eta") or 0.18))
+            open_price = res.get("openPrice") or old.get("openPrice")
+            close_price = res.get("closePrice") or by_symbol.get(_base(old.get("symbol")), {}).get("price")
+            opened_at = res.get("openedAt") or old.get("openedAt")
+            closed_at = res.get("closedAt") or _iso()
             record = {
                 "ticket": old.get("ticket"),
                 "symbol": old.get("symbol"),
                 "side": old.get("side"),
                 "volume": old.get("volume"),
-                "openPrice": old.get("openPrice"),
-                "closePrice": by_symbol.get(_base(old.get("symbol")), {}).get("price"),
+                "openPrice": open_price,
+                "entry": open_price,
+                "closePrice": close_price,
+                "stopLoss": old.get("stopLoss") or old.get("sl"),
+                "takeProfit": old.get("takeProfit") or old.get("tp") or old.get("targetTp"),
                 "pnl": round(pnl, 2),
                 "r": round(reward, 3),
-                "closedAt": _iso(),
+                "openedAt": opened_at,
+                "closedAt": closed_at,
+                "timeframe": old.get("timeframe") or "M15",
+                "riskAmount": risk_amount,
+                "modelName": state.get("modelName") or state.get("modelId") or "AI model",
                 "reason": old.get("reason"),
                 "pattern": old.get("pattern"),
                 "patternScore": old.get("patternScore"),
                 "flip": bool(old.get("flip", flip)),
             }
+            self._attach_setup(creds, account_id, record)
             closed_now.append(record)
             state["closed"].append(record)
             state["closed"] = state["closed"][-100:]
@@ -1868,6 +2183,7 @@ class AIAgent:
             elif not hedge_leg and row.get("side") and row.get("side") != side and float(row.get("confidence") or 0) >= (max(0.20, float(params.get("threshold", 0.05))) if flip else max(0.45, float(params.get("threshold", 0.40)))):
                 close_reason = "Opposite signal: %s confidence %.2f" % (row.get("side").upper(), float(row.get("confidence") or 0))
             if close_reason and not dry:
+                res: Dict[str, Any] = {}
                 with self._locked():
                     try:
                         self.pool.close_position(creds, {"ticket": pos.get("ticket"), "comment": taker})
@@ -1879,11 +2195,20 @@ class AIAgent:
                 risk_amount = float(entry.get("riskAmount") or 1.0)
                 reward = pnl / risk_amount if risk_amount > 0 else 0.0
                 weights = learn(weights, entry.get("contributions") or {}, reward, float(state.get("learning", {}).get("eta") or 0.18))
+                close_price = res.get("closePrice") or price
+                opened_at = res.get("openedAt") or entry.get("openedAt") or pos.get("openedAt")
                 record = {"ticket": pos.get("ticket"), "symbol": pos.get("symbol"), "side": side,
-                          "volume": pos.get("volume"), "openPrice": open_price,
-                          "closePrice": price, "pnl": round(pnl, 2), "r": round(reward, 3),
-                          "closedAt": _iso(), "reason": close_reason,
-                          "pattern": entry.get("pattern"), "patternScore": entry.get("patternScore")}
+                          "volume": pos.get("volume"), "openPrice": open_price, "entry": open_price,
+                          "closePrice": close_price, "stopLoss": entry.get("sl") or pos.get("stopLoss"),
+                          "takeProfit": entry.get("tp") or entry.get("targetTp") or pos.get("takeProfit"),
+                          "pnl": round(pnl, 2), "r": round(reward, 3),
+                          "openedAt": opened_at, "closedAt": res.get("closedAt") or _iso(),
+                          "timeframe": entry.get("timeframe") or old.get("timeframe") or "M15",
+                          "riskAmount": risk_amount,
+                          "modelName": state.get("modelName") or state.get("modelId") or "AI model",
+                          "reason": close_reason,
+                          "pattern": entry.get("pattern") or old.get("pattern"), "patternScore": entry.get("patternScore") or old.get("patternScore")}
+                self._attach_setup(creds, account_id, record)
                 state["closed"].append(record)
                 state["closed"] = state["closed"][-100:]
                 if flip and entry.get("flip", True):
