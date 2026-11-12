@@ -72,9 +72,9 @@ jobs:
           $server = ''
           if ($resp.accounts -and @($resp.accounts).Count -gt 0) { $server = [string]@($resp.accounts)[0].credentials.server }
           if ($server -match 'fxpro') {
-            $key = 'mt5-exness-6314'
-            $url = 'https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe'
-            $broker = 'fxpro-via-6314'
+            $key = 'mt5-fxpro-markets-20261112'
+            $url = 'https://download.mql5.com/cdn/web/fxpro.markets.ltd/mt5/fxpro5setup.exe'
+            $broker = 'fxpro-markets'
           } else {
             $key = 'mt5-exness-6314'
             $url = 'https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe'
