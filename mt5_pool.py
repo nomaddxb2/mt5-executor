@@ -285,7 +285,19 @@ class TerminalPool:
             return
         key = (str(credentials.get("login")), str(credentials.get("server")))
         if self.current and (str(self.current.get("login")), str(self.current.get("server"))) == key:
-            return
+            if mt5 is None:
+                return
+            try:
+                alive = mt5.terminal_info() is not None
+            except Exception:
+                alive = False
+            if alive:
+                return
+            print("[mt5-pool] IPC lost, reconnecting", flush=True)
+            self.current = None
+            self._symbol_cache.clear()
+            self._symbol_rows_cache = None
+            self._symbol_rows_at = 0.0
         self.connect(credentials)
 
     def _terminal_info(self) -> Dict[str, Any]:
@@ -402,6 +414,13 @@ class TerminalPool:
         if to is None:
             to = datetime.now(timezone.utc)
         rows = mt5.history_deals_get(frm, to) or []
+        magic = query.get("magic")
+        if magic not in (None, ""):
+            try:
+                wanted_magic = int(magic)
+                rows = [d for d in rows if int(getattr(d, "magic", 0) or 0) == wanted_magic]
+            except (TypeError, ValueError):
+                pass
         out = []
         for deal in rows[-limit:]:
             d = deal._asdict()
@@ -409,6 +428,9 @@ class TerminalPool:
                 {
                     "id": str(d.get("ticket")),
                     "ticket": d.get("position_id") or d.get("order"),
+                    "positionId": d.get("position_id"),
+                    "magic": int(d.get("magic") or 0),
+                    "entry": d.get("entry"),
                     "symbol": d.get("symbol"),
                     "side": "buy" if d.get("type") in (0, 2) else "sell",
                     "volume": _num(d.get("volume")),
@@ -424,6 +446,98 @@ class TerminalPool:
             )
         out.reverse()
         return {"deals": out, "count": len(out), "mode": "live"}
+
+    def history_positions(self, credentials: Dict[str, Any], magics: Any = None, since: Any = None) -> Dict[str, Any]:
+        self._ensure(credentials)
+        if self.dry_run or mt5 is None:
+            return {"positions": [], "count": 0, "mode": "dry-run"}
+        wanted = set()
+        for value in magics or []:
+            try:
+                wanted.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        since_dt = _parse_time(since)
+        if since_dt is not None and since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        frm = (since_dt - timedelta(days=2)) if since_dt else (now - timedelta(days=30))
+        rows = mt5.history_deals_get(frm, now)
+        if rows is None:
+            code, message = mt5.last_error()
+            raise Mt5Error("history_deals_get failed: %s" % message, "mt5_history_failed", {"code": code})
+        groups: Dict[int, List[Dict[str, Any]]] = {}
+        for deal in rows:
+            d = deal._asdict()
+            position_id = int(d.get("position_id") or 0)
+            if not position_id:
+                continue
+            groups.setdefault(position_id, []).append(d)
+        out = []
+        for position_id, deals in groups.items():
+            deals.sort(key=lambda d: int(d.get("time") or 0))
+            magic = 0
+            for d in deals:
+                candidate = int(d.get("magic") or 0)
+                if candidate and (not wanted or candidate in wanted):
+                    magic = candidate
+                    break
+            if wanted and magic not in wanted:
+                continue
+            entries = [d for d in deals if int(d.get("entry") if d.get("entry") is not None else -1) == 0]
+            exits = [d for d in deals if int(d.get("entry") if d.get("entry") is not None else -1) in (1, 3)]
+            if not entries:
+                entries = [deals[0]]
+                exits = deals[1:]
+            if not exits:
+                continue
+            net = 0.0
+            for d in deals:
+                deal_type = int(d.get("type") if d.get("type") is not None else -1)
+                volume = float(d.get("volume") or 0)
+                if deal_type == 0:
+                    net += volume
+                elif deal_type == 1:
+                    net -= volume
+            if abs(net) > 1e-8:
+                continue
+            pnl = 0.0
+            for d in deals:
+                try:
+                    pnl += float(d.get("profit") or 0) + float(d.get("commission") or 0) + float(d.get("swap") or 0)
+                except (TypeError, ValueError):
+                    continue
+            entry = entries[0]
+            exit_deal = exits[-1]
+            opened_at = _iso(min(int(d.get("time") or 0) for d in entries) or None)
+            closed_at = _iso(max(int(d.get("time") or 0) for d in exits) or None)
+            if since_dt is not None and closed_at:
+                try:
+                    closed_dt = datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
+                    if closed_dt < since_dt:
+                        continue
+                except ValueError:
+                    pass
+            out.append(
+                {
+                    "ticket": position_id,
+                    "positionId": position_id,
+                    "magic": magic,
+                    "symbol": entry.get("symbol") or exit_deal.get("symbol"),
+                    "side": "buy" if int(entry.get("type")) == 0 else "sell",
+                    "volume": round(sum(float(d.get("volume") or 0) for d in entries), 2),
+                    "openPrice": _num(entry.get("price"), 5),
+                    "closePrice": _num(exit_deal.get("price"), 5),
+                    "pnl": round(pnl, 2),
+                    "openedAt": opened_at,
+                    "closedAt": closed_at,
+                    "comment": exit_deal.get("comment") or "",
+                    "deals": len(deals),
+                    "source": "mt5",
+                }
+            )
+        out.sort(key=lambda r: r.get("closedAt") or "")
+        return {"positions": out, "count": len(out), "mode": "live"}
 
     def ticks(self, credentials: Dict[str, Any], symbol: str, count: int = 400) -> Dict[str, Any]:
         self._ensure(credentials)

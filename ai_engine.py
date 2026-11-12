@@ -1325,6 +1325,13 @@ class AIAgent:
                 self._arena_notify(account_id, "error", "⚠️ %s · cycle failed: %s" % (
                     spec.get("name") or spec["id"], str(e)[:240]))
 
+        try:
+            reconciled = self._arena_reconcile_history(creds, arena, specs)
+            if reconciled:
+                self.log("arena history reconciled %d closed positions" % reconciled)
+        except Exception as e:
+            self.log("arena history reconcile failed: %s" % e)
+
         if not arena.get("startingEquity"):
             for model in arena["models"].values():
                 eq = (model.get("state") or {}).get("startingEquity")
@@ -1345,13 +1352,15 @@ class AIAgent:
             medals = {1: "🥇", 2: "🥈", 3: "🥉"}
             lines = ["🏆 ARENA LEADERBOARD · cycle %d" % arena["cycle"]]
             for row in arena["leaderboard"]:
-                lines.append("%s #%d %s · %s · P/L %+.2f · %d trades · %.1f%% win · PF %.2f · %d open" % (
+                lines.append("%s #%d %s · %s · P/L %+.2f · %d trades (%dW/%dL) · %.1f%% win · PF %.2f · %d open" % (
                     medals.get(int(row.get("rank") or 0), "•"),
                     int(row.get("rank") or 0),
                     row.get("name") or "model",
                     row.get("role") or "AI",
                     float(row.get("pnl") or 0),
                     int(row.get("trades") or 0),
+                    int(row.get("wins") or 0),
+                    int(row.get("losses") or 0),
                     float(row.get("winRate") or 0),
                     float(row.get("profitFactor") or 0),
                     int(row.get("positions") or 0),
@@ -1373,13 +1382,62 @@ class AIAgent:
             except Exception as e:
                 self.log("ai account callback failed: %s" % e)
 
+    def _arena_reconcile_history(self, creds: Dict[str, Any], arena: Dict[str, Any], specs: List[Dict[str, Any]]) -> int:
+        magics = []
+        for spec in specs:
+            model = (arena.get("models") or {}).get(spec["id"]) or {}
+            magics.append(int(model.get("magic") or spec["magic"]))
+        with self._locked():
+            data = self.pool.history_positions(creds, magics, arena.get("startedAt"))
+        positions = data.get("positions") or []
+        by_magic: Dict[int, List[Dict[str, Any]]] = {}
+        for record in positions:
+            by_magic.setdefault(int(record.get("magic") or 0), []).append(record)
+        for spec in specs:
+            model = (arena.get("models") or {}).get(spec["id"]) or {}
+            mstate = model.get("state") or {}
+            magic = int(model.get("magic") or spec["magic"])
+            history_rows = by_magic.get(magic) or []
+            old_rows = {str(c.get("ticket")): c for c in (mstate.get("closed") or [])}
+            merged = []
+            for record in sorted(history_rows, key=lambda r: r.get("closedAt") or ""):
+                old = old_rows.get(str(record.get("ticket"))) or {}
+                item = dict(old)
+                item.update(record)
+                if old.get("reason"):
+                    item["reason"] = old["reason"]
+                item["source"] = "mt5"
+                merged.append(item)
+            mstate["closed"] = merged[-100:]
+            stats = compute_stats(merged, float(mstate.get("startingEquity") or arena.get("startingEquity") or 0))
+            mstate["stats"] = stats
+            realized = round(sum(float(r.get("pnl") or 0) for r in merged), 2)
+            floating = round(sum(float(p.get("profit") or 0) for p in (mstate.get("positions") or [])), 2)
+            mstate["floating"] = floating
+            mstate["aiPnl"] = round(realized + floating, 2)
+            mstate["historyStats"] = {
+                "trades": int(stats.get("trades") or 0),
+                "wins": int(stats.get("wins") or 0),
+                "losses": int(stats.get("losses") or 0),
+                "pnl": realized,
+                "source": "mt5",
+                "asOf": _iso(),
+            }
+            model["state"] = mstate
+            arena["models"][spec["id"]] = model
+        return len(positions)
+
     def _arena_leaderboard(self, arena: Dict[str, Any]) -> List[Dict[str, Any]]:
         start = float(arena.get("startingEquity") or 0)
         rows: List[Dict[str, Any]] = []
         for model in (arena.get("models") or {}).values():
             s = model.get("state") or {}
             stats = s.get("stats") or {}
+            history_stats = s.get("historyStats") or {}
             pnl = float(s.get("aiPnl") or 0)
+            realized = history_stats.get("pnl")
+            if realized is None:
+                realized = sum(float(c.get("pnl") or 0) for c in (s.get("closed") or []))
             equity = round((start + pnl), 2) if start else None
             ret = round((pnl / start * 100.0), 2) if start else 0.0
             rows.append({
@@ -1394,6 +1452,9 @@ class AIAgent:
                 "equity": equity,
                 "returnPct": ret,
                 "trades": int(stats.get("trades") or 0),
+                "wins": int(stats.get("wins") or 0),
+                "losses": int(stats.get("losses") or 0),
+                "realizedPnl": round(float(realized), 2),
                 "winRate": float(stats.get("winRate") or 0),
                 "profitFactor": float(stats.get("profitFactor") or 0),
                 "expectancy": float(stats.get("expectancy") or 0),
