@@ -43,6 +43,31 @@ def log_tail(limit=4000):
         return "<log error %s>" % exc
 
 
+def diagnose():
+    try:
+        r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq terminal64.exe", "/FO", "LIST"], capture_output=True, text=True, timeout=20)
+        out("tasklist", r.stdout.strip())
+    except Exception as exc:
+        out("tasklist error", exc)
+    try:
+        ps = subprocess.run(["powershell", "-NoProfile", "-Command", "Get-Process terminal64 -ErrorAction SilentlyContinue | Select-Object Id,Responding,MainWindowTitle | Format-List | Out-String"], capture_output=True, text=True, timeout=30)
+        out("process", ps.stdout.strip())
+    except Exception as exc:
+        out("process error", exc)
+    for path in sorted(glob.glob(os.path.join(DATA, "logs", "*.log"))):
+        try:
+            with open(path, "r", encoding="utf-16", errors="replace") as fh:
+                out("logfile", os.path.basename(path), fh.read()[-3000:])
+        except Exception as exc:
+            out("logfile error", path, exc)
+    try:
+        with open(os.path.join(DATA, "config", "start.ini"), "r", encoding="utf-16", errors="replace") as fh:
+            masked = "\n".join(("Password=***" if line.startswith("Password=") else line) for line in fh.read().splitlines())
+        out("start.ini contents", masked)
+    except Exception as exc:
+        out("start.ini read error", exc)
+
+
 def write_ini(creds):
     path = os.path.join(DATA, "config", "start.ini")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -99,7 +124,7 @@ def main():
     proc = subprocess.Popen([TERMINAL, "/portable", "/config:" + ini], cwd=DATA, close_fds=True)
     out("terminal pid", proc.pid)
 
-    deadline = time.time() + 120
+    deadline = time.time() + 210
     last = None
     while time.time() < deadline:
         time.sleep(3)
@@ -136,6 +161,7 @@ def main():
         except Exception:
             pass
     out("boot failed", last)
+    diagnose()
     out("log tail", log_tail(8000))
     return 1
 

@@ -125,7 +125,7 @@ jobs:
 
       - name: Boot MT5 session
         shell: pwsh
-        timeout-minutes: 4
+        timeout-minutes: 6
         env:
           MT5_API_URL: ${{ secrets.MT5_API_URL }}
           MT5_WORKER_SECRET: ${{ secrets.MT5_WORKER_SECRET }}
