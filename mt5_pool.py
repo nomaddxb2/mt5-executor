@@ -1065,12 +1065,17 @@ class TerminalPool:
         if self.dry_run:
             return {"position": {"status": "dry-run"}, "mode": "dry-run"}
         ticket = int(payload.get("ticket"))
+        rows = mt5.positions_get(ticket=ticket) or []
+        pos = rows[0]._asdict() if rows else {}
+        symbol = pos.get("symbol") or payload.get("symbol")
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
             "position": ticket,
             "sl": float(payload.get("stopLoss") or payload.get("sl") or 0),
             "tp": float(payload.get("takeProfit") or payload.get("tp") or 0),
         }
+        if symbol:
+            request["symbol"] = symbol
         result = self._send(request)
         rows = mt5.positions_get(ticket=ticket) or []
         pos = rows[0]._asdict() if rows else {}
@@ -1309,8 +1314,10 @@ class TerminalPool:
 
     def _send(self, request: Dict[str, Any]):
         last = None
-        for filling in (mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN):
-            request["type_filling"] = filling
+        fillings = (mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN) if request.get("action") in (mt5.TRADE_ACTION_DEAL, mt5.TRADE_ACTION_PENDING) else (None,)
+        for filling in fillings:
+            if filling is not None:
+                request["type_filling"] = filling
             last = mt5.order_send(request)
             if last is None:
                 continue
