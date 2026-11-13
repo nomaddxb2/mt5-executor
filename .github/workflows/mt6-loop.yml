@@ -1,0 +1,57 @@
+name: mt6-auto-trader
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '5 */6 * * *'
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: mt6-auto-trader
+  cancel-in-progress: false
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout mt6bridge
+        uses: actions/checkout@v4
+        with:
+          repository: nomaddxb2/mt6bridge
+          token: ${{ secrets.MT6_DISPATCH_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Restore auto state
+        uses: actions/cache@v4
+        with:
+          path: .auto-state.json
+          key: mt6-auto-state-${{ github.run_id }}
+          restore-keys: |
+            mt6-auto-state-
+      - name: Continuous model trader
+        env:
+          MT6_URL: https://mt6bridge.vercel.app
+          MT6_ARM_TOKEN: ${{ secrets.MT6_ARM_TOKEN }}
+          MT6_INTERVAL_SECONDS: '30'
+          MT6_RUN_SECONDS: '20700'
+          MT6_FETCH_TIMEOUT: '55'
+          MT6_STATE_FILE: .auto-state.json
+          MT6_DISPATCH_TOKEN: ${{ secrets.MT6_DISPATCH_TOKEN }}
+          MT6_TELEGRAM_REPO: nomaddxb2/mt5-executor
+          MT6_TELEGRAM_EVENT: telegram-result
+        run: node scripts/auto-loop.js
+      - name: Chain next 6h window
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.MT6_DISPATCH_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+        run: |
+          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/workflows/mt6-loop.yml/dispatches" \
+            -d "{\"ref\":\"$REF\"}"
